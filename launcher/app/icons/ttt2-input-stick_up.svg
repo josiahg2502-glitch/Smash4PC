@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+<!-- Tekken Tag 2 Ultimate Edition input icon "Left stick up": drawn for this project. -->
+<defs><radialGradient id="w" cx=".5" cy=".38" r=".7"><stop offset="0" stop-color="#fff"/><stop offset=".55" stop-color="#f1f1f1"/><stop offset="1" stop-color="#c4c4c4"/></radialGradient><radialGradient id="r" cx=".5" cy=".38" r=".7"><stop offset="0" stop-color="#ffb4a8"/><stop offset=".5" stop-color="#f04a3a"/><stop offset="1" stop-color="#c0160b"/></radialGradient><linearGradient id="d" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#cdcdcd"/><stop offset="1" stop-color="#fbfbfb"/></linearGradient></defs>
+<path d="M2.5,16A13.5 13.5 0 0 1 29.5,16A13.5 13.5 0 0 1 2.5,16Z" fill="#222222"/>
+<path d="M4.5,16A11.5 11.5 0 0 1 27.5,16A11.5 11.5 0 0 1 4.5,16Z" fill="url(#w)"/>
+<path d="M6.2,16A9.8 9.8 0 0 1 25.8,16A9.8 9.8 0 0 1 6.2,16Z" fill="#adadad"/>
+<path d="M7.2,16A8.8 8.8 0 0 1 24.8,16A8.8 8.8 0 0 1 7.2,16Z" fill="url(#d)"/>
+<path d="M15.08,5.79A1.25 1.25 0 0 1 16.92,5.79L22.04,11.39A1.05 1.05 0 0 1 21.27,13.15L18.85,13.15L18.85,24.2A0.95 0.95 0 0 1 17.9,25.15L14.1,25.15A0.95 0.95 0 0 1 13.15,24.2L13.15,13.15L10.73,13.15A1.05 1.05 0 0 1 9.96,11.39Z" fill="#8a1108"/>
+<path d="M15.89,6.54A0.15 0.15 0 0 1 16.11,6.54L21.15,12.05L18.3,12.05A0.55 0.55 0 0 0 17.75,12.6L17.75,24.05L14.25,24.05L14.25,12.6A0.55 0.55 0 0 0 13.7,12.05L10.85,12.05Z" fill="url(#r)"/>
+</svg>

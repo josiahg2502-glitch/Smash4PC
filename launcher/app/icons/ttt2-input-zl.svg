@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+<!-- Tekken Tag 2 Ultimate Edition input icon "ZL": drawn for this project. -->
+<defs><radialGradient id="w" cx=".5" cy=".38" r=".7"><stop offset="0" stop-color="#fff"/><stop offset=".55" stop-color="#f1f1f1"/><stop offset="1" stop-color="#c4c4c4"/></radialGradient></defs>
+<path d="M4,15A13 13 0 0 1 17,2L24.5,2A3.5 3.5 0 0 1 28,5.5L28,26A2 2 0 0 1 26,28L6,28A2 2 0 0 1 4,26Z" fill="#222222"/>
+<path d="M6,15A11 11 0 0 1 17,4L24.5,4A1.5 1.5 0 0 1 26,5.5L26,26L6,26Z" fill="url(#w)"/>
+<path d="M9,12L17,12L17,14L12.4,20L17,20L17,22L9,22L9,20L13.6,14L9,14ZM18,12L21,12L21,20L25,20L25,22L18,22Z" fill="#1e1e1e"/>
+</svg>

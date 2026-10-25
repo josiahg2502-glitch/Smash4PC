@@ -1,0 +1,42 @@
+{
+  "ZArchive": {
+    "url": "https://github.com/Exzap/ZArchive.git",
+    "revision": "965b66c8d67b6b7e30fd63b3b75aa91a99ff303b"
+  },
+  "addrlib": {
+    "url": "https://github.com/decaf-emu/addrlib.git",
+    "revision": "194162c47469ce620dd2470eb767ff5e42f5954a"
+  },
+  "zlib": {
+    "url": "https://github.com/madler/zlib.git",
+    "revision": "51b7f2abdade71cd9bb0e7a373ef2610ec6f9daf"
+  },
+  "SDL": {
+    "url": "https://github.com/libsdl-org/SDL.git",
+    "revision": "fa2c02bb6e21974a89ea9824bc53c9932abe5f9c"
+  },
+  "Vulkan-Headers": {
+    "url": "https://github.com/KhronosGroup/Vulkan-Headers.git",
+    "revision": "b0c3dd6851e22621f194306d511b9253e4c1577f"
+  },
+  "zstd": {
+    "url": "https://github.com/facebook/zstd.git",
+    "revision": "f8745da6ff1ad1e7bab384bd1f9d742439278e99"
+  },
+  "shaderc": {
+    "url": "https://github.com/google/shaderc.git",
+    "revision": "2c8cae778eec0283b44acbe7ed1a386865d78799"
+  },
+  "glslang": {
+    "url": "https://github.com/KhronosGroup/glslang.git",
+    "revision": "168d452a4f460d24b588fed08477a81c44ee27a1"
+  },
+  "spirv-headers": {
+    "url": "https://github.com/KhronosGroup/SPIRV-Headers.git",
+    "revision": "29981f65241605e08b0ede4cfeb999fe3b723c6a"
+  },
+  "spirv-tools": {
+    "url": "https://github.com/KhronosGroup/SPIRV-Tools.git",
+    "revision": "b707790a898e44038547df54580022fc1cf89c3d"
+  }
+}

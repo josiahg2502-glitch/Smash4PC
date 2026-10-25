@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Ultimate Launcher
+GenericName=Game Launcher
+Comment=Install and play Tekken Tag Tournament 2, and add Tekken 7's characters
+Exec=ttt2-launcher %f
+Icon=io.github.petexy.TekkenTag2UltimateEdition
+Terminal=false
+Categories=Game;
+Keywords=Tekken;Tekken Tag Tournament 2;Ultimate Edition;fighting;Wii U;
+StartupNotify=true
+StartupWMClass=io.github.petexy.TekkenTag2UltimateEdition

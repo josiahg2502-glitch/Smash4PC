@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+<!-- Tekken Tag 2 Ultimate Edition input icon "D-pad left": drawn for this project. -->
+<defs><radialGradient id="w" cx=".5" cy=".38" r=".7"><stop offset="0" stop-color="#fff"/><stop offset=".55" stop-color="#f1f1f1"/><stop offset="1" stop-color="#c4c4c4"/></radialGradient><radialGradient id="r" cx=".5" cy=".38" r=".7"><stop offset="0" stop-color="#ffb4a8"/><stop offset=".5" stop-color="#f04a3a"/><stop offset="1" stop-color="#c0160b"/></radialGradient></defs>
+<path d="M10,4.4A2.4 2.4 0 0 1 12.4,2L19.6,2A2.4 2.4 0 0 1 22,4.4L22,9.6A0.4 0.4 0 0 0 22.4,10L27.6,10A2.4 2.4 0 0 1 30,12.4L30,19.6A2.4 2.4 0 0 1 27.6,22L22.4,22A0.4 0.4 0 0 0 22,22.4L22,27.6A2.4 2.4 0 0 1 19.6,30L12.4,30A2.4 2.4 0 0 1 10,27.6L10,22.4A0.4 0.4 0 0 0 9.6,22L4.4,22A2.4 2.4 0 0 1 2,19.6L2,12.4A2.4 2.4 0 0 1 4.4,10L9.6,10A0.4 0.4 0 0 0 10,9.6Z" fill="#222222"/>
+<path d="M12,4.4A0.4 0.4 0 0 1 12.4,4L19.6,4A0.4 0.4 0 0 1 20,4.4L20,9.6A2.4 2.4 0 0 0 22.4,12L27.6,12A0.4 0.4 0 0 1 28,12.4L28,19.6A0.4 0.4 0 0 1 27.6,20L22.4,20A2.4 2.4 0 0 0 20,22.4L20,27.6A0.4 0.4 0 0 1 19.6,28L12.4,28A0.4 0.4 0 0 1 12,27.6L12,22.4A2.4 2.4 0 0 0 9.6,20L4.4,20A0.4 0.4 0 0 1 4,19.6L4,12.4A0.4 0.4 0 0 1 4.4,12L9.6,12A2.4 2.4 0 0 0 12,9.6Z" fill="url(#w)"/>
+<path d="M4.4,20A0.4 0.4 0 0 1 4,19.6L4,12.4A0.4 0.4 0 0 1 4.4,12L12.5,12L12.5,20Z" fill="url(#r)"/>
+<path d="M13.4,16A2.6 2.6 0 0 1 18.6,16A2.6 2.6 0 0 1 13.4,16Z" fill="#c9c9c9"/>
+<path d="M14.1,16.5A1.9 1.9 0 0 1 17.9,16.5A1.9 1.9 0 0 1 14.1,16.5Z" fill="#e9e9e9"/>
+</svg>

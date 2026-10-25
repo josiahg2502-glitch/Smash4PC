@@ -1,0 +1,2 @@
+// Smash 4 PC: the executable's icon (id 1, which SDL takes for the window).
+1 ICON "smash.ico"
