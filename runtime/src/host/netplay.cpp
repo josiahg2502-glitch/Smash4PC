@@ -43,7 +43,7 @@ using Clock = std::chrono::steady_clock;
 // ------------------------------------------------------------------ the protocol
 // UDP datagrams, a type byte first; numbers little-endian.
 constexpr uint32_t kMagic = 0x504E3453; // "S4NP"
-constexpr uint16_t kVersion = 2;
+constexpr uint16_t kVersion = 3;
 enum Type : uint8_t {
     kPunch = 1,      // either: opens the routers' way (ignored)
     kHello = 2,      // guest, until welcomed: magic, version, name (32 bytes)
@@ -56,7 +56,7 @@ enum Type : uint8_t {
     kBye = 9,        // either: leaving
 };
 constexpr size_t kPiece = 1150;                  // H.264 bytes a video datagram (under common MTUs)
-constexpr auto kSilence = std::chrono::seconds(5); // nothing heard for this long: gone
+constexpr auto kSilence = std::chrono::seconds(10); // nothing heard for this long: gone
 
 uint32_t le32(const uint8_t* p) {
     uint32_t v;
@@ -223,49 +223,50 @@ void set_codec_value(ICodecAPI* api, const GUID& what, uint32_t value) {
     api->SetValue(&what, &v);
 }
 
-// The H.264 frames an MFT gives for its input so far (sync MFTs: Windows' own encoder and decoder).
-// `on_change` handles a new output type (the decoder's first frame).
+// One ProcessOutput: `got(data, size, keyframe)` with what came out. `on_change` handles a new output type
+// (the decoder's first frame).
 template <typename F>
-HRESULT drain(IMFTransform* t, F&& got, const std::function<void()>& on_change = {}) {
-    for (;;) {
-        MFT_OUTPUT_STREAM_INFO info{};
-        t->GetOutputStreamInfo(0, &info);
-        IMFSample* sample = nullptr;
-        IMFMediaBuffer* buffer = nullptr;
-        const bool provides = info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES);
-        if (!provides) {
-            MFCreateSample(&sample);
-            MFCreateMemoryBuffer(std::max<DWORD>(info.cbSize, 1 << 20), &buffer);
-            sample->AddBuffer(buffer);
-        }
-        MFT_OUTPUT_DATA_BUFFER out{};
-        out.pSample = sample;
-        DWORD status = 0;
-        const HRESULT hr = t->ProcessOutput(0, 1, &out, &status);
-        release(out.pEvents);
-        if (hr == MF_E_TRANSFORM_STREAM_CHANGE && on_change) {
-            release(buffer);
-            release(out.pSample);
-            on_change();
-            continue;
-        }
-        if (SUCCEEDED(hr) && out.pSample) {
-            IMFMediaBuffer* contiguous = nullptr;
-            if (SUCCEEDED(out.pSample->ConvertToContiguousBuffer(&contiguous))) {
-                BYTE* data = nullptr;
-                DWORD length = 0;
-                if (SUCCEEDED(contiguous->Lock(&data, nullptr, &length))) {
-                    UINT32 key = 0;
-                    out.pSample->GetUINT32(MFSampleExtension_CleanPoint, &key);
-                    got(data, length, key != 0);
-                    contiguous->Unlock();
-                }
-                release(contiguous);
+HRESULT output_once(IMFTransform* t, F&& got, const std::function<void()>& on_change = {}) {
+    MFT_OUTPUT_STREAM_INFO info{};
+    t->GetOutputStreamInfo(0, &info);
+    IMFSample* sample = nullptr;
+    IMFMediaBuffer* buffer = nullptr;
+    const bool provides = info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES);
+    if (!provides) {
+        MFCreateSample(&sample);
+        MFCreateMemoryBuffer(std::max<DWORD>(info.cbSize, 4 << 20), &buffer);
+        sample->AddBuffer(buffer);
+    }
+    MFT_OUTPUT_DATA_BUFFER out{};
+    out.pSample = sample;
+    DWORD status = 0;
+    const HRESULT hr = t->ProcessOutput(0, 1, &out, &status);
+    release(out.pEvents);
+    if (hr == MF_E_TRANSFORM_STREAM_CHANGE && on_change) {
+        on_change();
+    } else if (SUCCEEDED(hr) && out.pSample) {
+        IMFMediaBuffer* contiguous = nullptr;
+        if (SUCCEEDED(out.pSample->ConvertToContiguousBuffer(&contiguous))) {
+            BYTE* data = nullptr;
+            DWORD length = 0;
+            if (SUCCEEDED(contiguous->Lock(&data, nullptr, &length))) {
+                UINT32 key = 0;
+                out.pSample->GetUINT32(MFSampleExtension_CleanPoint, &key);
+                got(data, length, key != 0);
+                contiguous->Unlock();
             }
+            release(contiguous);
         }
-        release(buffer);
-        release(out.pSample);
-        if (FAILED(hr)) return hr; // MF_E_TRANSFORM_NEED_MORE_INPUT: all out
+    }
+    release(buffer);
+    release(out.pSample);
+    return hr == MF_E_TRANSFORM_STREAM_CHANGE && on_change ? S_OK : hr;
+}
+
+// Everything a synchronous MFT (Windows' own encoder and decoder) has for its input so far.
+template <typename F>
+void drain(IMFTransform* t, F&& got, const std::function<void()>& on_change = {}) {
+    while (SUCCEEDED(output_once(t, got, on_change))) {
     }
 }
 
@@ -300,23 +301,107 @@ IMFMediaType* video_type(const GUID& subtype, uint32_t width, uint32_t height) {
 
 // ------------------------------------------------------------------ host
 
-// Windows' H.264 encoder, low-latency, baseline (no B-frames: each frame goes out as soon as it is coded).
-// shortcut: software encoding (a few ms a 720p frame on its own thread); hardware MFTs (NVENC, AMF, Quick Sync)
-// are asynchronous and need their event model, worth it for higher resolutions.
+// The H.264 encoder: the GPU's (NVENC, AMD's, Quick Sync: an asynchronous MFT, driven by its events) where
+// there is one, else Windows' own in software. Low latency, baseline (no B-frames: each frame goes out as soon as
+// it is coded), constant bitrate.
 class Encoder {
 public:
     bool open() {
         start_media_foundation();
+        if (!std::getenv("SMASH_NETPLAY_SOFTWARE_ENCODER") && open_hardware()) return true;
+        release(t_);
+        release(api_);
+        release(events_);
         if (FAILED(CoCreateInstance(CLSID_CMSH264EncoderMFT, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&t_)))) return false;
+        if (!configure()) return false;
+        std::fprintf(stderr, "ttt2: netplay: H.264 encoder: Windows' (software)\n");
+        return true;
+    }
+
+    template <typename F>
+    void encode(const std::vector<uint8_t>& nv12, int64_t time, bool key, F&& got) {
+        if (key && api_) set_codec_value(api_, CODECAPI_AVEncVideoForceKeyFrame, 1);
+        IMFSample* sample = sample_of(nv12.data(), nv12.size(), time);
+        if (sample == nullptr) return;
+        if (events_ == nullptr) {
+            if (t_->ProcessInput(0, sample, 0) == MF_E_NOTACCEPTING) {
+                drain(t_, got);
+                t_->ProcessInput(0, sample, 0);
+            }
+            sample->Release();
+            drain(t_, got);
+            return;
+        }
+        // Asynchronous: input when it asks for some, then its frame (it comes within a few ms).
+        bool given = false, out = false;
+        const auto start = Clock::now();
+        while (!out && Clock::now() - start < std::chrono::milliseconds(50)) {
+            IMFMediaEvent* e = nullptr;
+            if (FAILED(events_->GetEvent(MF_EVENT_FLAG_NO_WAIT, &e))) {
+                std::this_thread::sleep_for(std::chrono::microseconds(300));
+                continue;
+            }
+            MediaEventType type = MEUnknown;
+            e->GetType(&type);
+            e->Release();
+            if (type == METransformNeedInput) ++wanted_;
+            if (type == METransformHaveOutput) {
+                output_once(t_, got);
+                out = given;
+            }
+            if (!given && wanted_ > 0) {
+                --wanted_;
+                given = SUCCEEDED(t_->ProcessInput(0, sample, 0));
+                if (!given) break;
+            }
+        }
+        sample->Release();
+    }
+
+private:
+    bool open_hardware() {
+        MFT_REGISTER_TYPE_INFO in{MFMediaType_Video, MFVideoFormat_NV12}, out{MFMediaType_Video, MFVideoFormat_H264};
+        IMFActivate** found = nullptr;
+        UINT32 count = 0;
+        if (FAILED(MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER, &in, &out,
+                             &found, &count))) {
+            return false;
+        }
+        std::string name;
+        for (UINT32 i = 0; i < count; ++i) {
+            if (t_ == nullptr && SUCCEEDED(found[i]->ActivateObject(IID_PPV_ARGS(&t_)))) {
+                WCHAR* text = nullptr;
+                UINT32 length = 0;
+                if (SUCCEEDED(found[i]->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute, &text, &length))) {
+                    for (UINT32 k = 0; k < length; ++k) name += text[k] < 128 ? static_cast<char>(text[k]) : '?';
+                    CoTaskMemFree(text);
+                }
+            }
+            found[i]->Release();
+        }
+        CoTaskMemFree(found);
+        if (t_ == nullptr) return false;
+        IMFAttributes* attributes = nullptr;
+        if (SUCCEEDED(t_->GetAttributes(&attributes))) {
+            attributes->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
+            attributes->SetUINT32(CODECAPI_AVLowLatencyMode, TRUE); // (MF_LOW_LATENCY)
+            attributes->Release();
+        }
+        if (FAILED(t_->QueryInterface(IID_PPV_ARGS(&events_))) || !configure()) return false;
+        std::fprintf(stderr, "ttt2: netplay: H.264 encoder: %s (GPU)\n", name.c_str());
+        return true;
+    }
+
+    bool configure() {
         if (SUCCEEDED(t_->QueryInterface(IID_ICodecAPI, reinterpret_cast<void**>(&api_)))) {
             set_codec_value(api_, CODECAPI_AVLowLatencyMode, TRUE);
             set_codec_value(api_, CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR);
-            set_codec_value(api_, CODECAPI_AVEncCommonMeanBitRate, 10'000'000);
+            set_codec_value(api_, CODECAPI_AVEncCommonMeanBitRate, kBitrate);
             set_codec_value(api_, CODECAPI_AVEncMPVGOPSize, 120);
             set_codec_value(api_, CODECAPI_AVEncMPVDefaultBPictureCount, 0);
         }
         IMFMediaType* out = video_type(MFVideoFormat_H264, kStreamWidth, kStreamHeight);
-        out->SetUINT32(MF_MT_AVG_BITRATE, 10'000'000);
+        out->SetUINT32(MF_MT_AVG_BITRATE, kBitrate);
         out->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base);
         HRESULT hr = t_->SetOutputType(0, out, 0);
         out->Release();
@@ -330,22 +415,12 @@ public:
         return true;
     }
 
-    template <typename F>
-    void encode(const std::vector<uint8_t>& nv12, int64_t time, bool key, F&& got) {
-        if (key && api_) set_codec_value(api_, CODECAPI_AVEncVideoForceKeyFrame, 1);
-        IMFSample* sample = sample_of(nv12.data(), nv12.size(), time);
-        if (sample == nullptr) return;
-        if (t_->ProcessInput(0, sample, 0) == MF_E_NOTACCEPTING) {
-            drain(t_, got);
-            t_->ProcessInput(0, sample, 0);
-        }
-        sample->Release();
-        drain(t_, got);
-    }
-
-private:
+    // 1080p60 with a game's motion: about what streaming services use for it.
+    static constexpr uint32_t kBitrate = 12'000'000;
     IMFTransform* t_ = nullptr;
     ICodecAPI* api_ = nullptr;
+    IMFMediaEventGenerator* events_ = nullptr; // a hardware (asynchronous) encoder's
+    int wanted_ = 0;                            // inputs it asked for and did not get yet
 };
 
 // RGBA rows to NV12, BT.709 limited range (the guest's texture says so).
@@ -571,7 +646,11 @@ void host_rooms_main() {
             g_socket.send(peer.pub, kPunch);
             if (peer.lan.ip) g_socket.send(peer.lan, kPunch);
         }
-        std::this_thread::sleep_for(std::chrono::seconds(2));
+        // A word to each guest every second: loading a match can leave them without picture or sound for a while.
+        for (int i = 0; i < 2; ++i) {
+            send_all_guests(kPunch, nullptr, 0);
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
     }
 }
 
@@ -831,7 +910,7 @@ int run_guest(const std::string& target, const std::string& name) {
 
     char title[96];
     std::snprintf(title, sizeof title, "Smash 4 PC - netplay (player %d)", player);
-    SDL_Window* window = SDL_CreateWindow(title, 1280, 720, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    SDL_Window* window = SDL_CreateWindow(title, 1600, 900, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_MAXIMIZED);
     SDL_Renderer* renderer = window ? SDL_CreateRenderer(window, nullptr) : nullptr;
     if (renderer == nullptr) {
         show_error(std::string("No window: ") + SDL_GetError());
@@ -913,8 +992,10 @@ int run_guest(const std::string& target, const std::string& name) {
                 video_bytes += static_cast<uint32_t>(data.size());
                 decoder.decode(data.data(), data.size(), [&](const BYTE* nv12, UINT32 w, UINT32 h) {
                     if (w != width || h < height) return;
+                    // (1080 rows are coded as 1088: the picture's rows, then its colour plane's.)
                     std::lock_guard lock(picture_mutex);
-                    picture.assign(nv12, nv12 + size_t{w} * h * 3 / 2);
+                    picture.assign(nv12, nv12 + size_t{w} * height);
+                    picture.insert(picture.end(), nv12 + size_t{w} * h, nv12 + size_t{w} * h + size_t{w} * height / 2);
                     fresh = true;
                     ++pictures;
                 });

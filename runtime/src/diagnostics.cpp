@@ -230,11 +230,13 @@ uint64_t cafe_ppc_timebase(void) {
 
 void cafe_unimplemented_import(cafe::PPCContext& ctx, const char* module, const char* name) {
     // Miiverse (nn_olv, nn_olv2) and SpotPass (nn_boss) have closed, so the port does
-    // not implement them: a call gets what a console without the service
+    // not implement them (nor local wireless, nn_uds, below): a call gets what a console without the service
     // would. Constructors and destructors leave their object in r3, queries
     // answer 0, everything else fails with an nn::Result.
     const std::string_view m = module, n = name;
-    if (m == "nn_olv" || m == "nn_olv2" || m == "nn_boss") {
+    // Local wireless (nn_uds: Smash's 3DS-as-controller link) has no PC side either: it fails the same way, and the
+    // game says the connection could not be made.
+    if (m == "nn_olv" || m == "nn_olv2" || m == "nn_boss" || m == "nn_uds") {
         static const bool trace = std::getenv("TTT2_TRACE_CLOSED") != nullptr;
         if (trace) std::fprintf(stderr, "closed: %s:%s (lr 0x%08X)\n", module, name, ctx.lr);
         if (n.starts_with("__ct__") || n.starts_with("__as__") || n.starts_with("__dt__")) return;

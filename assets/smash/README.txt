@@ -71,7 +71,8 @@ one of the host's Wii U Pro Controllers. Nothing can fall out of sync, and frien
   window (F11: fullscreen) and your pads and keyboard play.
 No router setup is needed: the two PCs connect directly. A few connections (some mobile and carrier networks)
 don't allow that; join over a LAN or a VPN such as Tailscale instead (smash.exe --join ADDRESS).
-Guests see the game at 720p with the delay to the host added; a close connection plays best.
+Guests see the game in 1080p (encoded on the host's graphics card), with the delay to the host added; a close
+connection plays best. The host sends about 12 Mbit/s to each guest, so check your upload speed for big rooms.
 
 
 ONLINE (launcher, ONLINE)

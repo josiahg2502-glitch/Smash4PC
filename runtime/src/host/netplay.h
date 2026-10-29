@@ -21,8 +21,8 @@ namespace cafe::host::netplay {
 
 // The UDP port a host takes (any free one if it is in use); guests use any.
 constexpr uint16_t kDefaultPort = 52700;
-// The stream's picture: 720p (both sides multiples of 16, as H.264 codes them).
-constexpr uint32_t kStreamWidth = 1280, kStreamHeight = 720;
+// The stream's picture: 1080p.
+constexpr uint32_t kStreamWidth = 1920, kStreamHeight = 1080;
 
 // ------------------------------------------------------------------ host
 // Starts taking guests and lists the room as `name`'s; false (and a message) if it cannot.

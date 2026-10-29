@@ -12,7 +12,7 @@ namespace cafe::host::netplay {
 // The room server (SMASH_ROOM_SERVER overrides it, e.g. http://127.0.0.1:8787 for `wrangler dev`).
 constexpr const char* kRoomServer = "https://smash4pc-online.josiahg2502.workers.dev";
 // Rooms of other versions are not listed (the stream's protocol may differ).
-constexpr const char* kRoomBuild = "smash4pc-2";
+constexpr const char* kRoomBuild = "smash4pc-3";
 constexpr int kMaxPlayers = 8;
 
 struct Room {
