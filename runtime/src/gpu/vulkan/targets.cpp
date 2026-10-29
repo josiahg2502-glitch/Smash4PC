@@ -154,6 +154,48 @@ Target* Renderer::depth_target(uint32_t base_reg, uint32_t size_reg, uint32_t in
     return targets_.back().get();
 }
 
+void Renderer::refit_target(Target& t, float scale, uint32_t min_width, uint32_t min_height) {
+    const uint32_t width = std::max(scaled(t.pitch, scale), min_width);
+    const uint32_t height = std::max(scaled(t.height, scale), min_height);
+    if (std::getenv("TTT2_TRACE_TARGETS")) {
+        std::fprintf(stderr, "ttt2: gpu: %s target 0x%08X %ux%u x%g remade %ux%u x%g (drawn with larger targets)\n",
+                     t.depth ? "depth" : "color", t.address, t.pitch, t.height, static_cast<double>(t.scale), width,
+                     height, static_cast<double>(scale));
+    }
+    const VkImageUsageFlags usage = (t.depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) |
+                                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    Image old = t.image;
+    t.image = create_image(old.format, old.aspect, width, height, 1, 1, usage, VK_IMAGE_VIEW_TYPE_2D);
+    end_rendering();
+    barrier();
+    // Beyond the title's size: far and clear (the console's GPU does not clip there; what it reads is undefined).
+    const VkImageSubresourceRange all{old.aspect, 0, 1, 0, 1};
+    if (t.depth) {
+        const VkClearDepthStencilValue far{1.0f, 0};
+        vkCmdClearDepthStencilImage(cmd(), t.image.image, VK_IMAGE_LAYOUT_GENERAL, &far, 1, &all);
+    } else {
+        const VkClearColorValue none{};
+        vkCmdClearColorImage(cmd(), t.image.image, VK_IMAGE_LAYOUT_GENERAL, &none, 1, &all);
+    }
+    barrier();
+    VkImageBlit blit{};
+    blit.srcSubresource = blit.dstSubresource = {old.aspect, 0, 0, 1};
+    blit.srcOffsets[1] = {static_cast<int32_t>(old.width), static_cast<int32_t>(old.height), 1};
+    blit.dstOffsets[1] = {static_cast<int32_t>(old.width * scale / t.scale), static_cast<int32_t>(old.height * scale / t.scale), 1};
+    vkCmdBlitImage(cmd(), old.image, VK_IMAGE_LAYOUT_GENERAL, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
+                   t.depth || scale == t.scale ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
+    barrier();
+    submit(true); // recorded work may still use the old image
+    destroy_image(old);
+    // Interpolation's copies are the old size: made again when next needed.
+    destroy_image(t.start_copy);
+    destroy_image(t.end_copy);
+    t.start_copied = false;
+    t.scale = scale;
+    t.written = stamp();
+}
+
 Target* Renderer::depth_target(const gx2::DepthBuffer& buffer) {
     return depth_target(view_address(buffer.surface, buffer.view_mip) >> 8, buffer.db_depth_size,
                         buffer.db_depth_info);

@@ -19,6 +19,7 @@
 #include <deque>
 #include <filesystem>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -141,6 +142,20 @@ void note_profile_thread(uint32_t guest) {
     g_profile_threads.push_back({guest, h});
 }
 
+// A guest thread ending: its handle goes (Smash starts and joins ~1,600 threads a second; kept, they
+// piled up as millions of dead threads and a list reallocated under the lock).
+void forget_profile_thread() {
+    const DWORD id = GetCurrentThreadId();
+    std::lock_guard lock(g_profile_mutex);
+    for (auto it = g_profile_threads.begin(); it != g_profile_threads.end(); ++it) {
+        if (GetThreadId(it->second) != id) continue;
+        CloseHandle(it->second);
+        *it = g_profile_threads.back();
+        g_profile_threads.pop_back();
+        return;
+    }
+}
+
 std::atomic<bool> g_profiling{false};
 
 // Samples every thread for `seconds`, from `start` seconds on, into `path` (one profile at a time).
@@ -160,11 +175,9 @@ void run_profile(double start, double seconds, std::string path) {
         const auto end = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
         std::fprintf(stderr, "ttt2: profiling guest threads for %.1f s\n", seconds);
         while (std::chrono::steady_clock::now() < end) {
-            std::vector<std::pair<uint32_t, HANDLE>> threads;
-            {
-                std::lock_guard lock(g_profile_mutex);
-                threads = g_profile_threads;
-            }
+            // (Held while sampling: a thread ending closes its handle.)
+            std::unique_lock profile_lock(g_profile_mutex);
+            std::vector<std::pair<uint32_t, HANDLE>> threads = g_profile_threads;
             // The runtime's own threads too (GPU, display, audio), labelled
             // with their Windows thread id.
             constexpr bool all = true;
@@ -224,6 +237,7 @@ void run_profile(double start, double seconds, std::string path) {
                 }
                 ResumeThread(h);
             }
+            profile_lock.unlock();
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         std::fclose(out);
@@ -266,6 +280,7 @@ void request_profile_now() {
 }
 #else
 void note_profile_thread(uint32_t) {}
+void forget_profile_thread() {}
 void start_profiler() {}
 void request_profile_now() {}
 #endif
@@ -288,21 +303,51 @@ void* host_main(void* argument) {
     } else {
         exit_value = t->ctx.r[3]; // OSExitThread left its argument here
     }
+    forget_profile_thread();
     finish(t, exit_value);
     return nullptr;
 }
 
+#ifdef _WIN32
+// Host threads whose guest thread ended wait for the next one: Smash starts and joins about 30 threads a
+// frame, and a new Windows thread each time put its start-up on the frame.
+struct PoolWorker {
+    HANDLE wake;
+    Thread* job;
+};
+std::mutex g_pool_mutex;
+std::vector<PoolWorker*> g_idle_workers;
+
+DWORD WINAPI pool_main(LPVOID arg) {
+    auto* w = static_cast<PoolWorker*>(arg);
+    for (;;) {
+        host_main(w->job);
+        {
+            std::lock_guard lock(g_pool_mutex);
+            g_idle_workers.push_back(w);
+        }
+        WaitForSingleObject(w->wake, INFINITE);
+    }
+}
+#endif
+
 void start_host_thread(Thread* t) {
 #ifdef _WIN32
+    {
+        std::lock_guard lock(g_pool_mutex);
+        if (!g_idle_workers.empty()) {
+            PoolWorker* w = g_idle_workers.back();
+            g_idle_workers.pop_back();
+            w->job = t;
+            t->host_started = true;
+            SetEvent(w->wake);
+            return;
+        }
+    }
     // The stack reserved, not committed: winpthreads commits all of it, 64 MB a thread (2.7 GB for Smash's 40),
     // and online play's extra threads then ran the system's commit out.
-    HANDLE h = CreateThread(
-        nullptr, kHostStackSize,
-        [](LPVOID arg) -> DWORD {
-            host_main(arg);
-            return 0;
-        },
-        t, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+    auto* w = new PoolWorker{CreateEventW(nullptr, FALSE, FALSE, nullptr), t};
+    HANDLE h = CreateThread(nullptr, kHostStackSize, pool_main, w, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
     if (h == nullptr) {
         // (Windows refuses new threads once the process is exiting: the window was closed.)
         if (GetLastError() == ERROR_ACCESS_DENIED) return;

@@ -8,6 +8,7 @@
 // game and update folders), display.ini, cache\, mods\, fonts\launcher.ttf
 // (optional, else Bahnschrift / Segoe UI / DejaVu Sans).
 
+#include "host/cpu_level.h"
 #include "host/display_settings.h"
 #include "os/act_server.h"
 #include "os/online_identity.h"
@@ -17,6 +18,8 @@
 #include <SDL3/SDL_main.h>
 
 #ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #endif
 
@@ -50,7 +53,7 @@ using namespace cafe::host::paint;
 
 namespace {
 
-constexpr const char* kVersion = "0.1.0";
+constexpr const char* kVersion = "0.1.1";
 constexpr const char* kUpdateId = "0005000E10144F00"; // v304
 constexpr const char* kGameId = "0005000010144F00";   // USA
 
@@ -301,7 +304,9 @@ Image load_image(SDL_Renderer* renderer, const fs::path& path) {
 
 // ------------------------------------------------------------------ the launcher
 
-enum class Screen { kMain, kSettings, kMods, kOnline };
+enum class Screen { kMain, kSettings, kMods, kOnline, kNetplay };
+
+constexpr int kNetplayPort = 52700; // host/netplay.h's kDefaultPort
 
 struct Item {
     std::string label;
@@ -320,6 +325,9 @@ public:
             if (auto it = ini.find(kSlotKeys[s]); it != ini.end()) paths_[s] = it->second;
         }
         if (auto it = ini.find("game_folder"); it != ini.end()) find_titles(it->second, paths_); // older file
+        if (auto it = ini.find("netplay_host"); it != ini.end()) netplay_host_ = it->second == "yes";
+        if (auto it = ini.find("netplay_name"); it != ini.end()) netplay_name_ = it->second;
+        if (auto it = ini.find("netplay_join"); it != ini.end()) join_address_ = it->second;
         online::load(dir_ / "online");
         refresh();
         font_.open({dir_ / "fonts" / "launcher.ttf", "C:/Windows/Fonts/bahnschrift.ttf", "C:/Windows/Fonts/segoeui.ttf",
@@ -480,6 +488,7 @@ public:
     void open_screen(const std::string& name) {
         if (name == "settings") go(Screen::kSettings);
         if (name == "online") go(Screen::kOnline);
+        if (name == "netplay") go(Screen::kNetplay);
         if (name == "mods") go(Screen::kMods);
         if (name == "play") play();
     }
@@ -566,7 +575,9 @@ public:
 
 private:
     // The main menu: Play, the game / update / DLC folders, Settings, Mods, Quit.
-    enum MainItem { kPlay, kGameItem, kUpdateItem, kDlcItem, kOnlineItem, kSettingsItem, kModsItem, kQuitItem };
+    enum MainItem { kPlay, kGameItem, kUpdateItem, kDlcItem, kOnlineItem, kNetplayItem, kSettingsItem, kModsItem, kQuitItem };
+    // The Netplay page (host/netplay.h: the host's game streamed to its guests): hosting, a name, joining.
+    enum NetplayItem { kHostSwitch, kNameField, kAddressField, kJoin, kNetplayBack };
     // The Online page: the console's files, the Pretendo ID and password, signing in and out.
     enum OnlineItem { kConsoleFiles, kUserField, kPasswordField, kSignIn, kSignOut, kOnlineBack };
     static constexpr int kSettingsBack = 3;
@@ -612,6 +623,7 @@ private:
                      {"UPDATE", folder_value(kUpdate)},
                      {"DLC", folder_value(kDlc)},
                      {"ONLINE", online_value()},
+                     {"NETPLAY", netplay_host_ ? "Hosting" : ""},
                      {"SETTINGS"},
                      {"MODS", "", static_cast<int>(std::count_if(mods_.begin(), mods_.end(), [](const Mod& m) { return m.on; }))},
                      {"QUIT"}};
@@ -647,6 +659,18 @@ private:
                      {"PASSWORD", field(kPasswordField, password_, true)},
                      {"SIGN IN", signing_in_ ? "Signing in..." : ""},
                      {"SIGN OUT", online::account().present ? online::account().account_id : ""},
+                     {"BACK"}};
+            break;
+        }
+        case Screen::kNetplay: {
+            const auto field = [&](int item, const std::string& text) {
+                if (editing_ == item) return text + (std::fmod(time_, 1.0f) < 0.5f ? "|" : " ");
+                return text.empty() ? std::string("Type...") : text;
+            };
+            list_ = {{"HOST MY GAMES", netplay_host_ ? "On" : "Off"},
+                     {"MY NAME", field(kNameField, netplay_name_)},
+                     {"JOIN ADDRESS", field(kAddressField, join_address_)},
+                     {"JOIN GAME", process_ && joining_ ? "Playing..." : ""},
                      {"BACK"}};
             break;
         }
@@ -690,6 +714,11 @@ private:
             refresh();
             return;
         }
+        if (screen_ == Screen::kNetplay && selected_ == kHostSwitch) {
+            netplay_host_ = !netplay_host_;
+            save_launcher_ini();
+            return;
+        }
         if (screen_ == Screen::kMods && selected_ < static_cast<int>(mods_.size())) { // a mod's switch
             mods_[selected_].on = !mods_[selected_].on;
             save_mods();
@@ -727,6 +756,7 @@ private:
             if (selected_ == kPlay) play();
             if (const auto slot = folder_slot(selected_)) choose_folder(*slot);
             if (selected_ == kOnlineItem) go(Screen::kOnline);
+            if (selected_ == kNetplayItem) go(Screen::kNetplay);
             if (selected_ == kSettingsItem) go(Screen::kSettings);
             if (selected_ == kModsItem) go(Screen::kMods);
             if (selected_ == kQuitItem) quit_ = true;
@@ -734,6 +764,15 @@ private:
         case Screen::kSettings:
             if (selected_ == kSettingsBack) back();
             else change(1);
+            break;
+        case Screen::kNetplay:
+            switch (selected_) {
+            case kHostSwitch: change(1); break;
+            case kNameField:
+            case kAddressField: start_editing(selected_); break;
+            case kJoin: join(); break;
+            default: back(); break;
+            }
             break;
         case Screen::kOnline:
             switch (selected_) {
@@ -843,8 +882,12 @@ private:
         return std::nullopt;
     }
 
-    // The game's program: smash.exe is the update's (v304), smash-base.exe the game's own (v1.0).
-    fs::path game_exe() const { return dir_ / (valid_[kUpdate] ? "smash.exe" : "smash-base.exe"); }
+    // The game's program: smash.exe is the update's (v304), smash-base.exe the game's own (v1.0);
+    // smash-compat.exe is the update's for processors without AVX2/FMA.
+    fs::path game_exe() const {
+        if (!valid_[kUpdate]) return dir_ / "smash-base.exe";
+        return dir_ / (cafe::host::cpu_has_x86_64_v3() ? "smash.exe" : "smash-compat.exe");
+    }
 
     void play() {
         if (process_) return;
@@ -860,12 +903,18 @@ private:
         if (!ready()) return;
         std::error_code ec;
         if (!fs::exists(game_exe(), ec)) {
-            launch_error_ = "playing without the update needs smash-base.exe";
+            launch_error_ = "missing " + game_exe().filename().string();
+            return;
+        }
+        if (!valid_[kUpdate] && !cafe::host::cpu_has_x86_64_v3()) {
+            launch_error_ = "this processor lacks AVX2: add the update to play (smash-compat.exe)";
             return;
         }
         launch_error_.clear();
-        // smash.exe [--mod FOLDER]... UPDATE GAME; smash-base.exe GAME (mods are made for the update).
+        // smash.exe [--host PORT] [--mod FOLDER]... UPDATE GAME; smash-base.exe GAME (mods are made for the update).
         std::vector<std::string> words{game_exe().string()};
+        if (netplay_host_) words.insert(words.end(), {"--host", std::to_string(kNetplayPort)});
+        joining_ = false;
         if (valid_[kUpdate]) {
             for (const Mod& m : mods_) {
                 if (m.on) words.insert(words.end(), {"--mod", m.root.string()});
@@ -887,6 +936,53 @@ private:
         } else {
             launch_error_ = SDL_GetError();
         }
+    }
+
+    // Plays on a netplay host's game: smash.exe --join ADDRESS NAME (no game folder needed).
+    void join() {
+        if (process_) return;
+        if (join_address_.empty()) {
+            selected_ = kAddressField;
+            start_editing(kAddressField);
+            return;
+        }
+        save_launcher_ini();
+        const std::string exe = (dir_ / "smash.exe").string();
+        const std::string name = netplay_name_.empty() ? "Player" : netplay_name_;
+        const char* args[] = {exe.c_str(), "--join", join_address_.c_str(), name.c_str(), nullptr};
+        SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "SMASH_LOG", (dir_ / "smash.log").string().c_str(), true);
+        process_ = SDL_CreateProcess(args, false);
+        if (process_) {
+            joining_ = true;
+            exit_code_ = 0;
+            launch_error_.clear();
+            SDL_MinimizeWindow(window_);
+        } else {
+            launch_error_ = SDL_GetError();
+        }
+    }
+
+    // This PC's IPv4 addresses, for telling guests where to join.
+    static std::string local_addresses() {
+        std::string list;
+        static const bool started = [] {
+            WSADATA data;
+            return WSAStartup(MAKEWORD(2, 2), &data) == 0;
+        }();
+        char name[256] = {};
+        if (!started) return list;
+        if (gethostname(name, sizeof name) != 0) return list;
+        addrinfo hints{};
+        hints.ai_family = AF_INET;
+        addrinfo* found = nullptr;
+        if (getaddrinfo(name, nullptr, &hints, &found) != 0) return list;
+        for (addrinfo* a = found; a; a = a->ai_next) {
+            char text[64] = {};
+            inet_ntop(AF_INET, &reinterpret_cast<sockaddr_in*>(a->ai_addr)->sin_addr, text, sizeof text);
+            if (list.find(text) == std::string::npos) list += (list.empty() ? "" : ", ") + std::string(text);
+        }
+        freeaddrinfo(found);
+        return list;
     }
 
     void choose_folder(Slot slot) {
@@ -927,6 +1023,8 @@ private:
         out << "# Smash 4 PC's launcher: the game (0005000010144F00), its update (0005000E10144F00) and DLC\n"
                "# (0005000C10144F00) folders, as chosen in the menu. Only the game is needed.\n";
         for (int s = 0; s < kSlots; ++s) out << kSlotKeys[s] << " = " << paths_[s].string() << "\n";
+        out << "netplay_host = " << (netplay_host_ ? "yes" : "no") << "\nnetplay_name = " << netplay_name_
+            << "\nnetplay_join = " << join_address_ << "\n";
     }
 
     // Shortened with "..." in the middle to fit `width`.
@@ -980,8 +1078,31 @@ private:
             draw_online_status();
             return;
         }
-        if (screen_ != Screen::kMain && screen_ != Screen::kMods) return;
+        if (screen_ != Screen::kMain && screen_ != Screen::kMods && screen_ != Screen::kNetplay) return;
         const float H = layout_.h, x = layout_.text_x, y = H * 0.86f, px = H * 0.033f;
+        if (screen_ == Screen::kNetplay) {
+            std::string line, detail;
+            Color c = kDim;
+            if (!launch_error_.empty()) {
+                line = "Could not start: " + launch_error_;
+                c = kBad;
+            } else if (selected_ >= kAddressField && selected_ <= kJoin) {
+                line = "Play on a friend's game: their address (and :port if not " + std::to_string(kNetplayPort) + "), then Join.";
+                detail = "You need no game files to join. Your controller is one of their Pro Controllers.";
+            } else if (netplay_host_) {
+                if (addresses_.empty()) addresses_ = local_addresses();
+                line = "Hosting: friends join at " + (addresses_.empty() ? std::string("this PC's address") : addresses_) +
+                       " (port " + std::to_string(kNetplayPort) + ").";
+                detail = "Internet: forward TCP " + std::to_string(kNetplayPort) + " to this PC, or all join one Tailscale/ZeroTier network.";
+                c = kGood;
+            } else {
+                line = "Host: your game is streamed to up to 7 friends, who play as players 2-8.";
+                detail = "Everything works online this way: 8-Player Smash, every stage and mode, items and mods.";
+            }
+            font_.draw(r_, x, y, fit(line, px * 0.85f, layout_.w * 0.62f), px * 0.85f, c);
+            if (!detail.empty()) font_.draw(r_, x, y + H * 0.045f, fit(detail, px * 0.8f, layout_.w * 0.62f), px * 0.8f, kDim);
+            return;
+        }
         const float icon = px * 0.75f, ix = x - icon * 1.55f;
         if (screen_ == Screen::kMods && !mod_status_.empty()) {
             font_.draw(r_, x, y, fit(mod_status_, px * 0.85f, layout_.w * 0.6f), px * 0.85f, mod_ok_ ? kGood : kBad);
@@ -1062,14 +1183,19 @@ private:
         SDL_StartTextInput(window_);
     }
     void stop_editing() {
+        if (screen_ == Screen::kNetplay && editing_ >= 0) save_launcher_ini();
         editing_ = -1;
         SDL_StopTextInput(window_);
     }
 
     // Typing in the ID or password field; true if the event was the field's.
     bool text_event(const SDL_Event& e) {
-        std::string& text = editing_ == kUserField ? user_ : password_;
-        const size_t limit = editing_ == kUserField ? 16 : 64; // a PNID is at most 16 characters
+        const bool netplay = screen_ == Screen::kNetplay;
+        std::string& text = netplay ? (editing_ == kNameField ? netplay_name_ : join_address_)
+                            : editing_ == kUserField ? user_
+                                                     : password_;
+        // A PNID is at most 16 characters (and a netplay name, sent in 31 bytes).
+        const size_t limit = editing_ == kUserField || (netplay && editing_ == kNameField) ? 16 : 64;
         switch (e.type) {
         case SDL_EVENT_TEXT_INPUT:
             for (const char* c = e.text.text; *c && utf8_length(text) < limit; ++c) text += *c;
@@ -1087,7 +1213,9 @@ private:
                 // On from the ID to the password; from the password, sign in.
                 const int was = editing_;
                 stop_editing();
-                if (was == kUserField) {
+                if (netplay) {
+                    if (was == kAddressField && e.key.key != SDLK_TAB) join();
+                } else if (was == kUserField) {
                     selected_ = kPasswordField;
                     start_editing(kPasswordField);
                 } else if (e.key.key != SDLK_TAB) {
@@ -1467,6 +1595,9 @@ private:
     std::mutex install_mutex_;
     Installed install_result_;
     int editing_ = -1; // the field being typed in
+    // Netplay.
+    bool netplay_host_ = false, joining_ = false;
+    std::string netplay_name_, join_address_, addresses_;
     std::vector<SDL_FRect> online_rects_; // each Online row's box, for the mouse
     std::string user_, password_, online_status_;
     std::mutex sign_in_mutex_;

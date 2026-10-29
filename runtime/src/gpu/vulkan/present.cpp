@@ -61,35 +61,9 @@ double now_seconds() {
 
 } // namespace
 
-// The compute shader that scales a presentation image into the swapchain.
-constexpr const char* kScaleShader = R"(#version 460
-layout(local_size_x = 16, local_size_y = 16) in;
-layout(set = 0, binding = 0) uniform sampler2D source;
-layout(set = 0, binding = 1) writeonly uniform image2D target;
-layout(set = 0, binding = 2) readonly buffer Overlay { uint pixels[]; } overlay;
-layout(push_constant) uniform Rect {
-    ivec2 offset; ivec2 size; ivec2 extent;
-    float dim; float unused; ivec4 layers[2]; uvec2 base; vec2 opacity;
-} rect;
-void main() {
-    const ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
-    if (any(greaterThanEqual(xy, rect.extent))) return;
-    const ivec2 p = xy - rect.offset;
-    vec4 c = vec4(0.0, 0.0, 0.0, 1.0);
-    if (all(greaterThanEqual(p, ivec2(0))) && all(lessThan(p, rect.size))) {
-        c = vec4(textureLod(source, (vec2(p) + 0.5) / vec2(rect.size), 0.0).rgb, 1.0);
-    }
-    c.rgb *= 1.0 - rect.dim;
-    for (int i = 0; i < 2; ++i) { // premultiplied, over the picture
-        const ivec2 q = xy - rect.layers[i].xy;
-        if (all(greaterThanEqual(q, ivec2(0))) && all(lessThan(q, rect.layers[i].zw))) {
-            const vec4 o = unpackUnorm4x8(overlay.pixels[rect.base[i] + uint(q.y * rect.layers[i].z + q.x)]) * rect.opacity[i];
-            c.rgb = c.rgb * (1.0 - o.a) + o.rgb;
-        }
-    }
-    imageStore(target, xy, c);
-}
-)";
+// The compute shader that scales a presentation image into the swapchain (shaders/scale.comp, built to
+// SPIR-V with the runtime).
+#include "scale_comp.h"
 
 // gpu::set_overlay's layers, until the presentation thread takes them.
 namespace {
@@ -183,20 +157,11 @@ void Renderer::start_presenter() {
     present_queue_handle_ = compute_present_ ? ctx_.present_queue : ctx_.queue;
     choose_presentation(host::window_refresh_rate());
     if (compute_present_) {
-        shaderc_compile_options_t options = shaderc_compile_options_initialize();
-        shaderc_compile_options_set_target_env(options, shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_3);
-        shaderc_compilation_result_t result = shaderc_compile_into_spv(compiler_, kScaleShader, std::strlen(kScaleShader),
-                                                                       shaderc_compute_shader, "scale", "main", options);
-        shaderc_compile_options_release(options);
-        if (shaderc_result_get_compilation_status(result) != shaderc_compilation_status_success) {
-            fatal("Vulkan: the presentation shader does not compile: %s", shaderc_result_get_error_message(result));
-        }
         VkShaderModuleCreateInfo mci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        mci.codeSize = shaderc_result_get_length(result);
-        mci.pCode = reinterpret_cast<const uint32_t*>(shaderc_result_get_bytes(result));
+        mci.codeSize = sizeof kScaleSpirv;
+        mci.pCode = kScaleSpirv;
         VkShaderModule module;
         VK_CHECK(vkCreateShaderModule(ctx_.device, &mci, nullptr, &module));
-        shaderc_result_release(result);
         VkDescriptorSetLayoutBinding bindings[3]{};
         bindings[0] = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
         bindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
@@ -370,6 +335,7 @@ void Renderer::show_frame() {
         ++sequence_frame_;
         save_sequence_image(frames_per_frame_);
     }
+    stream_frame();
     uint64_t ready = 0;
     const uint32_t image = copy_scan_to_present_image(ready);
     if (frames_per_frame_ == 1) {

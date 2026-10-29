@@ -1,7 +1,8 @@
 find_package(ZLIB REQUIRED)
 find_package(Threads REQUIRED)
 if(WIN32)
-    set(CAFE_HOST_LIBS bcrypt ws2_32 winhttp) # digests (host/digest.h), sockets, HTTPS (host/http.h)
+    # digests (host/digest.h), sockets, HTTPS (host/http.h), netplay's H.264 (host/netplay.h: Media Foundation)
+    set(CAFE_HOST_LIBS bcrypt ws2_32 winhttp mfplat mfuuid wmcodecdspuuid strmiids ole32 oleaut32)
 else()
     find_package(OpenSSL 3 REQUIRED COMPONENTS Crypto)
     set(CAFE_HOST_LIBS OpenSSL::Crypto)
@@ -57,11 +58,13 @@ add_library(cafe_runtime OBJECT
     src/gpu/vulkan/formats.cpp
     src/gpu/vulkan/interpolate.cpp
     src/gpu/vulkan/present.cpp
+    src/gpu/vulkan/stream.cpp
     src/gpu/vulkan/png.cpp
     src/gpu/vulkan/renderer.cpp
     src/gpu/vulkan/targets.cpp
     src/gpu/vulkan/textures.cpp
     src/host/audio.cpp
+    src/host/netplay.cpp
     src/host/display_settings.cpp
     src/host/keymap.cpp
     src/host/window.cpp
@@ -85,6 +88,24 @@ target_link_libraries(cafe_runtime PUBLIC cemu_nex cafe_rpx cafe_title ${CAFE_HO
     Vulkan::Vulkan SDL3::SDL3 ${SHADERC_LIBRARY})
 # Vulkan structures are initialised with only their sType.
 target_compile_options(cafe_runtime PRIVATE -Wall -Wextra -Wpedantic -Wno-missing-field-initializers)
+
+# The runtime's own shaders, compiled to SPIR-V at build time (headers in the build folder).
+add_executable(spirv_embed src/gpu/vulkan/spirv_embed.cpp)
+target_link_libraries(spirv_embed PRIVATE ${SHADERC_LIBRARY})
+target_include_directories(spirv_embed SYSTEM PRIVATE ${Vulkan_INCLUDE_DIRS} ${CAFE_DEPS_PREFIX}/include)
+if(WIN32) # its shaderc DLL beside it, to run during the build
+    add_custom_command(TARGET spirv_embed POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CAFE_DEPS_PREFIX}/bin/libshaderc_shared.dll
+            ${CAFE_DEPS_PREFIX}/bin/libSPIRV-Tools-shared.dll $<TARGET_FILE_DIR:spirv_embed>)
+endif()
+set(CAFE_SHADER_OUT ${CMAKE_CURRENT_BINARY_DIR}/shaders)
+add_custom_command(OUTPUT ${CAFE_SHADER_OUT}/scale_comp.h
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CAFE_SHADER_OUT}
+    COMMAND spirv_embed comp ${CMAKE_CURRENT_SOURCE_DIR}/shaders/scale.comp ${CAFE_SHADER_OUT}/scale_comp.h kScaleSpirv
+    DEPENDS spirv_embed ${CMAKE_CURRENT_SOURCE_DIR}/shaders/scale.comp
+    VERBATIM)
+target_sources(cafe_runtime PRIVATE ${CAFE_SHADER_OUT}/scale_comp.h)
+target_include_directories(cafe_runtime PRIVATE ${CAFE_SHADER_OUT})
 
 # Tekken Tag Tournament 2's own changes to the game (title/): guest functions
 # replaced by address and mid-function hooks, so only the ttt2 target links them.

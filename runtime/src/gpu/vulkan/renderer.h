@@ -225,6 +225,8 @@ private:
     void copy_target_region(const Target& src, const Image& dst, float dst_scale, uint32_t dst_layer,
                             uint32_t width, uint32_t height);
     bool upscaled_size(uint32_t width, uint32_t height) const;
+    // Remakes a target at `scale` and at least min_width x min_height pixels, its contents kept.
+    void refit_target(Target& t, float scale, uint32_t min_width = 0, uint32_t min_height = 0);
     // The scale of upscaled targets: scale_ is relative to a 720-row image,
     // the title's TV image may be 1080 rows.
     float target_scale() const { return scale_ * 720.0f / static_cast<float>(tv_height()); }
@@ -545,6 +547,16 @@ private:
     std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> pipelines_;
     VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
     std::atomic<uint32_t> new_pipelines_{0};
+
+    // Netplay hosting (stream.cpp): each frame's TV image, scaled to the stream's size and read back for the
+    // encoder, which waits for the copy itself.
+    void stream_frame();
+    Image stream_image_;
+    struct StreamSlot {
+        Buffer buffer;
+        std::atomic<bool> busy{false};
+    };
+    StreamSlot stream_slots_[3];
 
     // Scan-out: the last frame copied to each scan buffer (TV, DRC).
     Image scan_[2];

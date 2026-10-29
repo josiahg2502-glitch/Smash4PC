@@ -10,7 +10,9 @@
 
 #include "gpu/gpu.h"
 #include "host/audio.h"
+#include "host/cpu_level.h"
 #include "host/display_settings.h"
+#include "host/netplay.h"
 #include "host/window.h"
 #include "os/act_server.h"
 #include "os/online_identity.h"
@@ -60,7 +62,7 @@ void usage(const char* argv0) {
                  "  executable. The system fonts are fonts\\CafeStd.ttf (CafeCn, CafeKr,\n"
                  "  CafeTw) next to this executable, else Segoe UI. TTT2_GPU=null runs\n"
                  "  without a window.\n",
-                 argv0);
+                 argv0, argv0);
 }
 
 // Objects the game imports as data are created by the library that owns
@@ -108,11 +110,33 @@ uint32_t guest_strdup(const char* text) {
 
 int main(int argc, char** argv) {
     using namespace cafe;
+    // --join HOST[:PORT] [NAME]: play on another PC's game (netplay guest): no game files, no game code run.
+    if (argc >= 3 && std::strcmp(argv[1], "--join") == 0) {
+        return host::netplay::run_guest(argv[2], argc >= 4 ? argv[3] : "Player");
+    }
+#ifndef SMASH_COMPAT
+    // The translated code is built for x86-64-v3: on an older processor its first AVX2 or FMA instruction
+    // closes the game without a word (smash-compat.exe is the build for those).
+    if (!host::cpu_has_x86_64_v3()) {
+        const char* why = "This processor lacks AVX2/FMA (x86-64-v3), which smash.exe is built for.\n"
+                          "Start the game from Smash 4 PC.exe, which picks smash-compat.exe on this PC.";
+        std::fprintf(stderr, "smash: %s\n", why);
+#ifdef _WIN32
+        MessageBoxA(nullptr, why, "Smash 4 PC", MB_OK | MB_ICONERROR);
+#endif
+        return 1;
+    }
+#endif
     // --mod FOLDER (repeatable, the first wins): a folder holding content/ laid over the game's.
     // --dlc FOLDER: the DLC title (code/app.xml, content/<item>/), reported to the game through nn_aoc.
+    // --host PORT: take netplay guests (host/netplay.h) on that port.
     std::vector<std::filesystem::path> layers;
-    while (argc >= 3 && (std::strcmp(argv[1], "--mod") == 0 || std::strcmp(argv[1], "--dlc") == 0)) {
-        if (std::strcmp(argv[1], "--mod") == 0) {
+    uint16_t host_port = 0;
+    while (argc >= 3 && (std::strcmp(argv[1], "--mod") == 0 || std::strcmp(argv[1], "--dlc") == 0 ||
+                         std::strcmp(argv[1], "--host") == 0)) {
+        if (std::strcmp(argv[1], "--host") == 0) {
+            host_port = static_cast<uint16_t>(std::atoi(argv[2]));
+        } else if (std::strcmp(argv[1], "--mod") == 0) {
             layers.emplace_back(argv[2]);
             std::fprintf(stderr, "smash: mod %s\n", argv[2]);
         } else {
@@ -187,6 +211,7 @@ int main(int argc, char** argv) {
     const bool headless =
         (gpu && std::strcmp(gpu, "null") == 0) || !host::open_window("Smash 4 PC");
     host::open_audio();
+    if (host_port != 0) host::netplay::start_host(host_port);
     if (headless) return run();
     smash::start_overlay(std::filesystem::absolute(argv[0]).parent_path());
     std::atomic<bool> finished{false};

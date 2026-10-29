@@ -774,6 +774,37 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
     if ((depth_control & 7) != 0 && (r(reg::DB_DEPTH_INFO) & 7) != 0 && r(reg::DB_DEPTH_BASE) != 0) {
         depth = depth_target(r(reg::DB_DEPTH_BASE), r(reg::DB_DEPTH_SIZE), r(reg::DB_DEPTH_INFO));
     }
+    // A pass is clipped to its smallest attachment, the console's GPU is not:
+    // a title-sized target drawn with upscaled ones is upscaled too, and an
+    // attachment smaller than the others is enlarged, or all but their
+    // top-left corner is lost (Smash's effects: a 960x544 buffer drawn with
+    // a 512x272 mask as color1).
+    if (!replaying_) {
+        float top = depth ? depth->scale : 1;
+        for (uint32_t i = 0; i < color_count; ++i) top = colors[i] ? std::max(top, colors[i]->scale) : top;
+        const auto promote = [&](const Target* t) {
+            if (t && t->scale < top && !t->write_back) refit_target(*const_cast<Target*>(t), top);
+        };
+        for (uint32_t i = 0; i < color_count; ++i) promote(colors[i]);
+        promote(depth);
+        uint32_t width = 0, height = 0;
+        const auto measure = [&](const Target* t) {
+            if (t) width = std::max(width, t->image.width), height = std::max(height, t->image.height);
+        };
+        for (uint32_t i = 0; i < color_count; ++i) measure(colors[i]);
+        measure(depth);
+        // Only as far as the scissor reaches: what the draw can write.
+        const uint32_t br = r(reg::PA_SC_GENERIC_SCISSOR_TL + 4), vbr = r(reg::PA_SC_VPORT_SCISSOR_0_TL + 4);
+        width = std::min(width, static_cast<uint32_t>(std::ceil(std::min(br & 0x7FFF, vbr & 0x7FFF) * top)));
+        height = std::min(height, static_cast<uint32_t>(std::ceil(std::min((br >> 16) & 0x7FFF, (vbr >> 16) & 0x7FFF) * top)));
+        const auto enlarge = [&](const Target* t) {
+            if (t && t->scale == top && !t->write_back && (t->image.width < width || t->image.height < height)) {
+                refit_target(*const_cast<Target*>(t), top, width, height);
+            }
+        };
+        for (uint32_t i = 0; i < color_count; ++i) enlarge(colors[i]);
+        enlarge(depth);
+    }
     const bool rasterizer_discard = (r(reg::PA_CL_CLIP_CNTL) >> 22) & 1;
     const bool stream_out = r(reg::VGT_STRMOUT_EN) & 1;
     if (color_count == 0 && depth == nullptr && !stream_out) {
@@ -917,6 +948,10 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
     if (mixed_scales) {
         report_once("draw into upscaled and title-sized targets at once, twice the scale",
                     static_cast<uint32_t>(2 * pass_scale));
+        for (uint32_t i = 0; i < color_count; ++i) {
+            if (colors[i]) report_once("  mixed-scale pass: color target", colors[i]->pitch << 16 | colors[i]->height << 4 | static_cast<uint32_t>(colors[i]->scale));
+        }
+        if (depth) report_once("  mixed-scale pass: depth target", depth->pitch << 16 | depth->height << 4 | static_cast<uint32_t>(depth->scale));
     }
     dc.alpha_ref = std::bit_cast<float>(r(reg::SX_ALPHA_REF));
     dc.point_size = static_cast<float>((r(reg::PA_SU_POINT_SIZE) >> 16) & 0xFFFF) / 8.0f * pass_scale;

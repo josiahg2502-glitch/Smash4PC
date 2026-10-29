@@ -11,6 +11,8 @@ No game files come with it: you need your own dump of the game from your own Wii
 WHAT YOU NEED
 -------------
 - Windows 10 or 11 (64-bit) and a GPU with Vulkan 1.3 (NVIDIA GTX 900 series or newer, AMD RX 400 or newer, Intel Arc or recent integrated).
+- Any 64-bit processor. smash.exe is built for AVX2 processors (Intel Haswell / AMD Ryzen and newer); on older
+  ones (no AVX2) the launcher runs smash-compat.exe instead, which is slower and needs the update.
 - Your dump of Super Smash Bros. for Wii U (USA), in the folder layout Cemu uses (code\, content\, meta\):
     - the game,        0005000010144F00   (needed)
     - the update v304, 0005000E10144F00   (recommended: all fighters, stages and fixes)
@@ -59,6 +61,19 @@ MODS (launcher, MODS)
 - OPEN MODS FOLDER shows mods\, if you'd rather manage the folders yourself.
 
 
+NETPLAY (launcher, NETPLAY)
+---------------------------
+Play with friends on their PCs, up to 8 players, in any mode, stage, item setting or mod. The host's game is the
+only one running: it is streamed to each friend (like Steam Remote Play Together), and their controller plays as
+one of the host's Wii U Pro Controllers. Nothing can fall out of sync, and friends need no game files.
+- Host: switch HOST MY GAMES on and choose PLAY. The page shows the addresses friends join at (port 52700).
+  Over the internet, forward TCP port 52700 on your router to your PC, or all join one Tailscale or ZeroTier
+  network and use its address.
+- Join: type the host's address in JOIN ADDRESS (add :port if it isn't 52700) and choose JOIN GAME. Their
+  game opens in a window (F11: fullscreen); your pads and keyboard play.
+Guests see the game at 720p with the host's delay to them added; a close connection plays best.
+
+
 ONLINE (launcher, ONLINE)
 -------------------------
 Smash's own online modes work on Pretendo Network, the community replacement for Nintendo Network:
@@ -86,6 +101,10 @@ TROUBLESHOOTING
 - Black screen or a crash at start: update your GPU driver (Vulkan 1.3 is needed).
 - Mods don't show: they need the update folder chosen, and content\ somewhere inside the mod's folder.
 - Online sign-in fails: check the console files are your own Wii U's and the console isn't banned on Pretendo.
+- A screen waits and nothing you press works: check smash.log's "pad connected" lines. The first pad that
+  presses a button becomes the GamePad, so press a button on the pad you play with.
+- Netplay: friends can't connect: the host's port 52700 must reach their PC (router forwarding, or the same
+  LAN or VPN), and Windows' firewall must allow smash.exe (Windows asks the first time you host).
 
 
 LICENSES

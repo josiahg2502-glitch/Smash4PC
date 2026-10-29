@@ -256,6 +256,10 @@ void init_heaps(uint32_t mem2_begin) {
     commit_guest_memory(layout::kMem1Base, layout::kMem1Size);
     commit_guest_memory(layout::kForegroundBucketBase, layout::kForegroundBucketSize);
     for (const uint32_t lc : layout::kLockedCacheBase) commit_guest_memory(lc, layout::kLockedCacheSize);
+    // The top page reads as zeros: a lookup that finds nothing (-1) and indexes from a null table lands
+    // just below 4 GiB, which the console survives (Smash's per-costume announcer call with the US4MP
+    // mod pack's sound config, which has no such table).
+    commit_guest_memory(0xFFFFF000u, 0x1000);
     set_mem2_bounds(begin, layout::kMem2End);
     g_base_heaps[0] = create_frame_heap(layout::kMem1Base, layout::kMem1Size);
     g_base_heaps[1] = create_exp_heap(begin, layout::kMem2End - begin);

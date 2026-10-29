@@ -4,6 +4,7 @@
 #include "cafe/runtime.h"
 #include "host/display_settings.h"
 #include "host/keymap.h"
+#include "host/netplay.h"
 #include "gpu/gpu.h"
 
 #include <SDL3/SDL.h>
@@ -167,6 +168,7 @@ void set_controller(Controller kind) {
 void note_controller(const SDL_Event& event) {
     switch (event.type) {
     case SDL_EVENT_GAMEPAD_ADDED:
+        std::fprintf(stderr, "ttt2: input: pad connected: %s\n", SDL_GetGamepadNameForID(event.gdevice.which));
         if (!g_controller_used) set_controller(kind_of(event.gdevice.which));
         break;
     case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
@@ -216,14 +218,40 @@ os::ProPadState pro_pad(SDL_Gamepad* pad) {
 // that (and in titles without them) every pad drives the GamePad.
 std::array<SDL_JoystickID, 1 + os::pro::kChannels> g_pad_slots{};
 
+// A netplay guest's slot (host/netplay.h): no host pad takes it.
+constexpr SDL_JoystickID kGuestSlot = 0xFFFFFFFFu;
+
 void assign_pad_slots(const SDL_JoystickID* ids, int count) {
+    for (size_t slot = 1; slot < g_pad_slots.size(); ++slot) {
+        os::ProPadState unused;
+        const bool guest = netplay::remote_pad(static_cast<int>(slot - 1), unused);
+        if (guest) g_pad_slots[slot] = kGuestSlot; // (a host pad there moves below)
+        else if (g_pad_slots[slot] == kGuestSlot) g_pad_slots[slot] = 0;
+    }
     for (SDL_JoystickID& slot : g_pad_slots) {
-        if (slot != 0 && std::find(ids, ids + count, slot) == ids + count) slot = 0;
+        if (slot != 0 && slot != kGuestSlot && std::find(ids, ids + count, slot) == ids + count) slot = 0;
     }
     for (int i = 0; i < count; ++i) {
         if (std::find(g_pad_slots.begin(), g_pad_slots.end(), ids[i]) != g_pad_slots.end()) continue;
         const auto free = std::find(g_pad_slots.begin(), g_pad_slots.end(), SDL_JoystickID{0});
         if (free != g_pad_slots.end()) *free = ids[i];
+    }
+    // Until the GamePad's pad presses something, the first pad that does becomes the GamePad: a device
+    // that never sends input (a virtual pad driver, a wheel) would otherwise hold it, and screens that
+    // read only the GamePad (the "Joins the Battle!" unlocks) would wait forever.
+    static SDL_JoystickID used = 0;
+    if (g_pad_slots[0] != 0 && g_pad_slots[0] == used) return;
+    for (size_t slot = 0; slot < g_pad_slots.size(); ++slot) {
+        SDL_Gamepad* pad = g_pad_slots[slot] && g_pad_slots[slot] != kGuestSlot ? SDL_GetGamepadFromID(g_pad_slots[slot]) : nullptr;
+        if (pad == nullptr) continue;
+        bool pressed = false;
+        for (int b = 0; b < SDL_GAMEPAD_BUTTON_COUNT && !pressed; ++b) {
+            pressed = SDL_GetGamepadButton(pad, static_cast<SDL_GamepadButton>(b));
+        }
+        if (!pressed) continue;
+        used = g_pad_slots[slot];
+        std::swap(g_pad_slots[0], g_pad_slots[slot]);
+        break;
     }
 }
 
@@ -299,6 +327,7 @@ void update_input() {
         state.right_y = std::clamp(state.right_y - axis(pad, SDL_GAMEPAD_AXIS_RIGHTY), -1.0f, 1.0f);
     }
     SDL_free(ids);
+    for (int c = 0; pros && c < os::pro::kChannels; ++c) netplay::remote_pad(c, channels[c]);
     os::set_gamepad_state(state);
     for (int c = 0; pros && c < os::pro::kChannels; ++c) os::set_pro_pad_state(c, channels[c]);
 }
@@ -311,6 +340,8 @@ void update_size() {
 }
 
 } // namespace
+
+os::ProPadState pad_as_pro(SDL_Gamepad* pad) { return pro_pad(pad); }
 
 bool open_window(const char* title) {
     // The identifier is the Wayland app id: ttt2.desktop's (ttt2 --install).
@@ -428,6 +459,15 @@ bool run_event_loop(const std::function<bool()>& finished) {
                 // F10: profile the next ten seconds (profile-<n>.txt beside the executable).
                 if (event.key.scancode == SDL_SCANCODE_F10 && !event.key.repeat) os::request_profile();
                 break;
+            case SDL_EVENT_GAMEPAD_BUTTON_DOWN: {
+                // Both sticks clicked: F12 from a pad, mid-fight.
+                const SDL_GamepadButton other = event.gbutton.button == SDL_GAMEPAD_BUTTON_LEFT_STICK ? SDL_GAMEPAD_BUTTON_RIGHT_STICK
+                                              : event.gbutton.button == SDL_GAMEPAD_BUTTON_RIGHT_STICK ? SDL_GAMEPAD_BUTTON_LEFT_STICK
+                                                                                                      : SDL_GAMEPAD_BUTTON_INVALID;
+                SDL_Gamepad* pad = SDL_GetGamepadFromID(event.gbutton.which);
+                if (other != SDL_GAMEPAD_BUTTON_INVALID && pad && SDL_GetGamepadButton(pad, other)) gpu::request_frame_trace();
+                break;
+            }
             default: break;
             }
         }

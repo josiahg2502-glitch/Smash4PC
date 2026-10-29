@@ -32,7 +32,7 @@ system libraries, with its GPU commands and shaders translated to Vulkan. No emu
 
 ## Install
 
-1. Download `Smash4PC-v0.1.0-Windows.zip` from [Releases](../../releases) and unzip it anywhere.
+1. Download `Smash4PC-v0.1.1-Windows.zip` from [Releases](../../releases) and unzip it anywhere.
 2. Run **Smash 4 PC.exe** and choose **PLAY**. It asks for your game folder (`0005000010144F00`), then the update
    (`0005000E10144F00`, recommended) and the DLC (`0005000C10144F00`, optional): the folders Cemu uses, dumped
    with Dumpling.

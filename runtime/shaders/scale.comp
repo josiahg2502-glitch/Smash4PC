@@ -1,0 +1,27 @@
+#version 460
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) uniform sampler2D source;
+layout(set = 0, binding = 1) writeonly uniform image2D target;
+layout(set = 0, binding = 2) readonly buffer Overlay { uint pixels[]; } overlay;
+layout(push_constant) uniform Rect {
+    ivec2 offset; ivec2 size; ivec2 extent;
+    float dim; float unused; ivec4 layers[2]; uvec2 base; vec2 opacity;
+} rect;
+void main() {
+    const ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(xy, rect.extent))) return;
+    const ivec2 p = xy - rect.offset;
+    vec4 c = vec4(0.0, 0.0, 0.0, 1.0);
+    if (all(greaterThanEqual(p, ivec2(0))) && all(lessThan(p, rect.size))) {
+        c = vec4(textureLod(source, (vec2(p) + 0.5) / vec2(rect.size), 0.0).rgb, 1.0);
+    }
+    c.rgb *= 1.0 - rect.dim;
+    for (int i = 0; i < 2; ++i) { // premultiplied, over the picture
+        const ivec2 q = xy - rect.layers[i].xy;
+        if (all(greaterThanEqual(q, ivec2(0))) && all(lessThan(q, rect.layers[i].zw))) {
+            const vec4 o = unpackUnorm4x8(overlay.pixels[rect.base[i] + uint(q.y * rect.layers[i].z + q.x)]) * rect.opacity[i];
+            c.rgb = c.rgb * (1.0 - o.a) + o.rgb;
+        }
+    }
+    imageStore(target, xy, c);
+}

@@ -1,5 +1,7 @@
 #include "host/audio.h"
 
+#include "host/netplay.h"
+
 #include <SDL3/SDL.h>
 
 #include <algorithm>
@@ -120,6 +122,7 @@ void queue_audio(const float* frames, uint32_t count) {
         }
     }
     if (g_dump) dump(frames, count);
+    netplay::audio(frames, count);
 }
 
 uint32_t queued_audio_frames() {

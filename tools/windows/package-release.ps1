@@ -16,6 +16,7 @@ New-Item -ItemType Directory -Force $stage | Out-Null
 
 Copy-Item (Join-Path $upstream 'build\Smash 4 PC.exe'), (Join-Path $upstream 'build\smash.exe') $stage
 Copy-Item (Join-Path $upstream 'build-base\smash.exe') (Join-Path $stage 'smash-base.exe')
+Copy-Item (Join-Path $upstream 'build-compat\smash-compat.exe') $stage
 Copy-Item (Join-Path $upstream 'build-deps\prefix\bin\*.dll') $stage
 Copy-Item (Join-Path $upstream 'assets\smash\logo.png') (Join-Path $stage 'title-logo.png')
 Copy-Item (Join-Path $upstream 'assets\smash\launcher-background.jpg') $stage
