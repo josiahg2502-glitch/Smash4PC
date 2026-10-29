@@ -785,7 +785,9 @@ int run_guest(const std::string& target, const std::string& name) {
                 for (const Introduction& peer : r.peers) {
                     if (peer.id != room) continue;
                     std::lock_guard lock(candidates_mutex);
-                    for (Endpoint e : {peer.pub, peer.lan}) {
+                    // SMASH_NETPLAY_PUBLIC_ONLY=1: only the public address, as from another network (testing on one PC).
+                    static const bool public_only = std::getenv("SMASH_NETPLAY_PUBLIC_ONLY") != nullptr;
+                    for (Endpoint e : {peer.pub, public_only ? Endpoint{} : peer.lan}) {
                         if (e.ip && std::find(candidates.begin(), candidates.end(), e) == candidates.end()) candidates.push_back(e);
                     }
                     introduced = true;
