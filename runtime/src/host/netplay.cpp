@@ -24,7 +24,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
-#include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -38,60 +38,30 @@ os::ProPadState pad_as_pro(SDL_Gamepad* pad); // host/window.cpp
 namespace cafe::host::netplay {
 namespace {
 
+using Clock = std::chrono::steady_clock;
+
 // ------------------------------------------------------------------ the protocol
-// Packets: a type byte, the payload's length (4 bytes, little-endian), the payload.
+// UDP datagrams, a type byte first; numbers little-endian.
 constexpr uint32_t kMagic = 0x504E3453; // "S4NP"
-constexpr uint16_t kVersion = 1;
+constexpr uint16_t kVersion = 2;
 enum Type : uint8_t {
-    kHello = 1,   // guest: magic, version, name (32 bytes)
-    kWelcome = 2, // host: channel (1 byte), picture width and height (2 bytes each)
-    kFull = 3,    // host: no free controller, the connection closes
-    kInput = 4,   // guest: buttons (os::pro bits, 4 bytes), sticks (4 x int16, up positive)
-    kVideo = 5,   // host: H.264 (Annex B) for one frame
-    kAudio = 6,   // host: 48 kHz stereo int16 frames
+    kPunch = 1,      // either: opens the routers' way (ignored)
+    kHello = 2,      // guest, until welcomed: magic, version, name (32 bytes)
+    kWelcome = 3,    // host: channel (1 byte), picture width and height (2 bytes each)
+    kFull = 4,       // host: no free controller
+    kInput = 5,      // guest, every frame: sequence (4), buttons (os::pro bits, 4), sticks (4 x int16, up positive)
+    kVideo = 6,      // host: frame (4), piece (2), pieces (2), keyframe (1), then that piece of the H.264 frame
+    kAudio = 7,      // host: 48 kHz stereo int16 frames
+    kKeyRequest = 8, // guest: a frame was lost, send a keyframe
+    kBye = 9,        // either: leaving
 };
-constexpr uint32_t kMaxPacket = 4u << 20;
+constexpr size_t kPiece = 1150;                  // H.264 bytes a video datagram (under common MTUs)
+constexpr auto kSilence = std::chrono::seconds(5); // nothing heard for this long: gone
 
-bool send_all(SOCKET s, const void* data, size_t size) {
-    const char* p = static_cast<const char*>(data);
-    while (size) {
-        const int n = send(s, p, static_cast<int>(std::min<size_t>(size, 1 << 20)), 0);
-        if (n <= 0) return false;
-        p += n;
-        size -= static_cast<size_t>(n);
-    }
-    return true;
-}
-
-bool recv_all(SOCKET s, void* data, size_t size) {
-    char* p = static_cast<char*>(data);
-    while (size) {
-        const int n = recv(s, p, static_cast<int>(size), 0);
-        if (n <= 0) return false;
-        p += n;
-        size -= static_cast<size_t>(n);
-    }
-    return true;
-}
-
-std::vector<uint8_t> packet(Type type, const void* payload, size_t size) {
-    std::vector<uint8_t> p(5 + size);
-    p[0] = type;
-    const auto n = static_cast<uint32_t>(size);
-    std::memcpy(p.data() + 1, &n, 4);
-    if (size) std::memcpy(p.data() + 5, payload, size);
-    return p;
-}
-
-bool read_packet(SOCKET s, Type& type, std::vector<uint8_t>& payload) {
-    uint8_t header[5];
-    if (!recv_all(s, header, 5)) return false;
-    uint32_t size;
-    std::memcpy(&size, header + 1, 4);
-    if (size > kMaxPacket) return false;
-    type = static_cast<Type>(header[0]);
-    payload.resize(size);
-    return size == 0 || recv_all(s, payload.data(), size);
+uint32_t le32(const uint8_t* p) {
+    uint32_t v;
+    std::memcpy(&v, p, 4);
+    return v;
 }
 
 void start_winsock() {
@@ -102,10 +72,136 @@ void start_winsock() {
     });
 }
 
-void no_delay(SOCKET s) {
-    BOOL on = TRUE;
-    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&on), sizeof on);
+sockaddr_in address_of(Endpoint e) {
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(e.ip);
+    a.sin_port = htons(e.port);
+    return a;
 }
+
+Endpoint endpoint_of(const sockaddr_in& a) { return {ntohl(a.sin_addr.s_addr), ntohs(a.sin_port)}; }
+
+// The game's UDP socket (one a process), with STUN for its public address.
+class Socket {
+public:
+    bool open(uint16_t port) {
+        start_winsock();
+        s_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (s_ == INVALID_SOCKET) return false;
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_port = htons(port);
+        if (bind(s_, reinterpret_cast<sockaddr*>(&a), sizeof a) != 0) {
+            a.sin_port = 0; // taken: any port
+            if (bind(s_, reinterpret_cast<sockaddr*>(&a), sizeof a) != 0) return false;
+        }
+        int size = 8 << 20;
+        setsockopt(s_, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&size), sizeof size);
+        setsockopt(s_, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&size), sizeof size);
+        // (Windows reports an ICMP "port unreachable" as an error on the next receive: not a reason to stop.)
+        BOOL off = FALSE;
+        DWORD ignored = 0;
+        WSAIoctl(s_, _WSAIOW(IOC_VENDOR, 12) /* SIO_UDP_CONNRESET */, &off, sizeof off, nullptr, 0, &ignored, nullptr, nullptr);
+        DWORD timeout = 200;
+        setsockopt(s_, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof timeout);
+        socklen_t length = sizeof a;
+        getsockname(s_, reinterpret_cast<sockaddr*>(&a), &length);
+        lan_ = {local_ip(), ntohs(a.sin_port)};
+        return true;
+    }
+
+    void send(Endpoint to, const void* data, size_t size) const {
+        const sockaddr_in a = address_of(to);
+        sendto(s_, static_cast<const char*>(data), static_cast<int>(size), 0, reinterpret_cast<const sockaddr*>(&a), sizeof a);
+    }
+    void send(Endpoint to, Type type, const void* payload = nullptr, size_t size = 0) const {
+        uint8_t p[1500];
+        p[0] = type;
+        if (size) std::memcpy(p + 1, payload, std::min(size, sizeof p - 1));
+        send(to, p, 1 + std::min(size, sizeof p - 1));
+    }
+
+    // A datagram (STUN's answers are taken here); 0 when none came within 200 ms.
+    size_t receive(uint8_t* data, size_t capacity, Endpoint& from) {
+        sockaddr_in a{};
+        socklen_t length = sizeof a;
+        const int n = recvfrom(s_, reinterpret_cast<char*>(data), static_cast<int>(capacity), 0, reinterpret_cast<sockaddr*>(&a), &length);
+        if (n <= 0) return 0;
+        from = endpoint_of(a);
+        if (n >= 20 && data[0] == 0x01 && data[1] == 0x01 && le32(data + 4) == 0x42A41221) { // a STUN answer
+            take_stun(data, static_cast<size_t>(n));
+            return 0;
+        }
+        return static_cast<size_t>(n);
+    }
+
+    // Asks STUN (stun.l.google.com) for this socket's public address; the answer comes to receive().
+    void ask_stun() {
+        static Endpoint server = [] {
+            addrinfo hints{};
+            hints.ai_family = AF_INET;
+            hints.ai_socktype = SOCK_DGRAM;
+            addrinfo* found = nullptr;
+            Endpoint e{};
+            if (getaddrinfo("stun.l.google.com", "19302", &hints, &found) == 0 && found) {
+                e = endpoint_of(*reinterpret_cast<sockaddr_in*>(found->ai_addr));
+                freeaddrinfo(found);
+            }
+            return e;
+        }();
+        if (server.ip == 0) return;
+        uint8_t request[20] = {0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xA4, 0x42};
+        for (int i = 8; i < 20; ++i) request[i] = static_cast<uint8_t>(random_id());
+        send(server, request, sizeof request);
+    }
+
+    Endpoint lan() const { return lan_; }
+    Endpoint pub() const {
+        std::lock_guard lock(mutex_);
+        return pub_;
+    }
+
+private:
+    void take_stun(const uint8_t* p, size_t n) {
+        for (size_t at = 20; at + 4 <= n;) {
+            const uint16_t type = static_cast<uint16_t>(p[at] << 8 | p[at + 1]);
+            const uint16_t length = static_cast<uint16_t>(p[at + 2] << 8 | p[at + 3]);
+            if (at + 4 + length > n) break;
+            const uint8_t* v = p + at + 4;
+            if ((type == 0x0020 || type == 0x0001) && length >= 8 && v[1] == 0x01) { // (XOR-)MAPPED-ADDRESS, IPv4
+                uint16_t port = static_cast<uint16_t>(v[2] << 8 | v[3]);
+                uint32_t ip = static_cast<uint32_t>(v[4] << 24 | v[5] << 16 | v[6] << 8 | v[7]);
+                if (type == 0x0020) port ^= 0x2112, ip ^= 0x2112A442;
+                std::lock_guard lock(mutex_);
+                pub_ = {ip, port};
+                return;
+            }
+            at += 4 + ((length + 3) & ~3u);
+        }
+    }
+
+    static uint32_t local_ip() {
+        char name[256] = {};
+        if (gethostname(name, sizeof name) != 0) return 0;
+        addrinfo hints{};
+        hints.ai_family = AF_INET;
+        addrinfo* found = nullptr;
+        if (getaddrinfo(name, nullptr, &hints, &found) != 0) return 0;
+        uint32_t ip = 0;
+        for (addrinfo* a = found; a && ip == 0; a = a->ai_next) {
+            const uint32_t v = ntohl(reinterpret_cast<sockaddr_in*>(a->ai_addr)->sin_addr.s_addr);
+            if ((v >> 24) != 127) ip = v;
+        }
+        freeaddrinfo(found);
+        return ip;
+    }
+
+    SOCKET s_ = INVALID_SOCKET;
+    Endpoint lan_;
+    mutable std::mutex mutex_;
+    Endpoint pub_;
+};
 
 template <typename T>
 void release(T*& p) {
@@ -278,79 +374,72 @@ void to_nv12(const uint8_t* rgba, bool bgra, std::vector<uint8_t>& out) {
 }
 
 struct Guest {
-    SOCKET socket = INVALID_SOCKET;
+    Endpoint address;
     int channel = 0;
     std::string name;
-    std::atomic<bool> alive{true};
-    bool need_key = true; // its video starts at a keyframe (under g_mutex)
-    os::ProPadState pad{};
+    bool need_key = true; // its video starts at a keyframe
+    uint32_t input_sequence = 0;
     bool pressed = false; // (logged once)
-    // Sending, on a thread of its own: a slow guest only loses its own frames.
-    std::mutex send_mutex;
-    std::condition_variable send_cv;
-    std::deque<std::vector<uint8_t>> queue;
-    size_t queued_video = 0;
+    os::ProPadState pad{};
+    Clock::time_point heard = Clock::now();
 };
 
-std::mutex g_mutex; // the guests and their pads
-std::array<std::shared_ptr<Guest>, os::pro::kChannels> g_guests;
+Socket g_socket;
+std::mutex g_mutex; // the guests
+std::array<std::optional<Guest>, os::pro::kChannels> g_guests;
 std::atomic<int> g_guest_count{0};
 std::atomic<bool> g_hosting{false}, g_force_key{false};
+std::string g_room_name;
 
-void enqueue(Guest& g, std::vector<uint8_t> p, bool video) {
-    {
-        std::lock_guard lock(g.send_mutex);
-        if (video) {
-            // Over three frames behind: drop video until the next keyframe.
-            if (g.queued_video >= 3) {
-                std::lock_guard guests(g_mutex);
-                g.need_key = true;
-                g_force_key = true;
-                return;
-            }
-            ++g.queued_video;
-        } else if (g.queue.size() > 400) {
-            return; // (a stalled guest: its sound waits no longer)
-        }
-        g.queue.push_back(std::move(p));
+Guest* guest_at(Endpoint e) {
+    for (auto& g : g_guests) {
+        if (g && g->address == e) return &*g;
     }
-    g.send_cv.notify_one();
+    return nullptr;
 }
 
-void sender(std::shared_ptr<Guest> g) {
-    for (;;) {
-        std::vector<uint8_t> p;
-        {
-            std::unique_lock lock(g->send_mutex);
-            g->send_cv.wait(lock, [&] { return !g->queue.empty() || !g->alive; });
-            if (!g->alive) return;
-            p = std::move(g->queue.front());
-            g->queue.pop_front();
-            if (p[0] == kVideo) --g->queued_video;
-        }
-        if (!send_all(g->socket, p.data(), p.size())) {
-            g->alive = false;
-            return;
-        }
-    }
+void drop(Guest& g, const char* why) {
+    std::fprintf(stderr, "ttt2: netplay: %s (player %d) %s\n", g.name.c_str(), g.channel + 2, why);
+    g_guests[g.channel].reset();
+    --g_guest_count;
 }
 
-void broadcast(Type type, const void* data, size_t size, bool key = false) {
-    std::vector<std::shared_ptr<Guest>> to;
+// One H.264 frame to every guest that can take it, in pieces.
+void send_video(const uint8_t* data, size_t size, bool key) {
+    static uint32_t frame = 0;
+    ++frame;
+    std::vector<Endpoint> to;
     {
         std::lock_guard lock(g_mutex);
         for (auto& g : g_guests) {
-            if (!g || !g->alive) continue;
-            if (type == kVideo) {
-                if (g->need_key && !key) continue;
-                g->need_key = false;
-            }
-            to.push_back(g);
+            if (!g || (g->need_key && !key)) continue;
+            g->need_key = false;
+            to.push_back(g->address);
         }
     }
-    if (to.empty()) return;
-    const std::vector<uint8_t> p = packet(type, data, size);
-    for (auto& g : to) enqueue(*g, p, type == kVideo);
+    const auto pieces = static_cast<uint16_t>((size + kPiece - 1) / kPiece);
+    uint8_t p[10 + kPiece];
+    p[0] = kVideo;
+    std::memcpy(p + 1, &frame, 4);
+    std::memcpy(p + 7, &pieces, 2);
+    p[9] = key;
+    for (uint16_t i = 0; i < pieces; ++i) {
+        const size_t n = std::min(kPiece, size - size_t{i} * kPiece);
+        std::memcpy(p + 5, &i, 2);
+        std::memcpy(p + 10, data + size_t{i} * kPiece, n);
+        for (const Endpoint& e : to) g_socket.send(e, p, 10 + n);
+    }
+}
+
+void send_all_guests(Type type, const void* data, size_t size) {
+    std::vector<Endpoint> to;
+    {
+        std::lock_guard lock(g_mutex);
+        for (auto& g : g_guests) {
+            if (g) to.push_back(g->address);
+        }
+    }
+    for (const Endpoint& e : to) g_socket.send(e, type, data, size);
 }
 
 // The renderer's newest frame, waiting for the encoder (older ones are dropped).
@@ -370,7 +459,7 @@ void encoder_main() {
         return;
     }
     std::vector<uint8_t> nv12;
-    const auto start = std::chrono::steady_clock::now();
+    const auto start = Clock::now();
     for (;;) {
         PendingFrame f;
         {
@@ -382,86 +471,108 @@ void encoder_main() {
         f.wait();
         to_nv12(f.pixels, f.bgra, nv12);
         f.release();
-        const int64_t time = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count() / 100;
+        const int64_t time = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count() / 100;
         encoder.encode(nv12, time, g_force_key.exchange(false),
-                       [](const BYTE* data, DWORD size, bool key) { broadcast(kVideo, data, size, key); });
+                       [](const BYTE* data, DWORD size, bool key) { send_video(data, size, key); });
     }
 }
 
-void drop_guest(const std::shared_ptr<Guest>& g) {
-    {
+// What the guests send.
+void host_receive_main() {
+    std::vector<uint8_t> p(2048);
+    for (;;) {
+        Endpoint from;
+        const size_t n = g_socket.receive(p.data(), p.size(), from);
+        const auto now = Clock::now();
         std::lock_guard lock(g_mutex);
-        if (g_guests[g->channel] == g) g_guests[g->channel].reset();
-    }
-    g->alive = false;
-    g->send_cv.notify_all();
-    closesocket(g->socket);
-    --g_guest_count;
-    std::fprintf(stderr, "ttt2: netplay: %s (player %d) left\n", g->name.c_str(), g->channel + 2);
-}
-
-void receiver(std::shared_ptr<Guest> g) {
-    Type type;
-    std::vector<uint8_t> p;
-    while (g->alive && read_packet(g->socket, type, p)) {
-        if (type != kInput || p.size() < 12) continue;
-        os::ProPadState s{true};
-        std::memcpy(&s.buttons, p.data(), 4);
-        int16_t axes[4];
-        std::memcpy(axes, p.data() + 4, 8);
-        s.left_x = axes[0] / 32767.0f;
-        s.left_y = axes[1] / 32767.0f;
-        s.right_x = axes[2] / 32767.0f;
-        s.right_y = axes[3] / 32767.0f;
-        std::lock_guard lock(g_mutex);
-        if (s.buttons && !g->pad.buttons && !g->pressed) {
-            g->pressed = true;
-            std::fprintf(stderr, "ttt2: netplay: player %d's controller works\n", g->channel + 2);
+        for (auto& g : g_guests) {
+            if (g && now - g->heard > kSilence) drop(*g, "stopped answering");
         }
-        g->pad = s;
+        if (n == 0) continue;
+        Guest* g = guest_at(from);
+        if (g) g->heard = now;
+        switch (p[0]) {
+        case kHello: {
+            if (g) { // (the welcome was lost)
+                const uint8_t w[5] = {static_cast<uint8_t>(g->channel), kStreamWidth & 0xFF, kStreamWidth >> 8,
+                                      kStreamHeight & 0xFF, kStreamHeight >> 8};
+                g_socket.send(from, kWelcome, w, sizeof w);
+                break;
+            }
+            uint16_t version = 0;
+            if (n < 39 || le32(p.data() + 1) != kMagic || (std::memcpy(&version, p.data() + 5, 2), version != kVersion)) break;
+            const auto free = std::find_if(g_guests.begin(), g_guests.end(), [](const auto& x) { return !x; });
+            if (free == g_guests.end()) {
+                g_socket.send(from, kFull);
+                break;
+            }
+            Guest& guest = free->emplace();
+            guest.address = from;
+            guest.channel = static_cast<int>(free - g_guests.begin());
+            guest.name.assign(reinterpret_cast<const char*>(p.data() + 7), strnlen(reinterpret_cast<const char*>(p.data() + 7), 31));
+            ++g_guest_count;
+            g_force_key = true;
+            const uint8_t w[5] = {static_cast<uint8_t>(guest.channel), kStreamWidth & 0xFF, kStreamWidth >> 8,
+                                  kStreamHeight & 0xFF, kStreamHeight >> 8};
+            g_socket.send(from, kWelcome, w, sizeof w);
+            std::fprintf(stderr, "ttt2: netplay: %s joined as player %d\n", guest.name.c_str(), guest.channel + 2);
+            break;
+        }
+        case kInput: {
+            if (!g || n < 17) break;
+            const uint32_t sequence = le32(p.data() + 1);
+            if (sequence <= g->input_sequence) break; // (late)
+            g->input_sequence = sequence;
+            os::ProPadState s{true};
+            s.buttons = le32(p.data() + 5);
+            int16_t axes[4];
+            std::memcpy(axes, p.data() + 9, 8);
+            s.left_x = axes[0] / 32767.0f;
+            s.left_y = axes[1] / 32767.0f;
+            s.right_x = axes[2] / 32767.0f;
+            s.right_y = axes[3] / 32767.0f;
+            if (s.buttons && !g->pressed) {
+                g->pressed = true;
+                std::fprintf(stderr, "ttt2: netplay: player %d's controller works\n", g->channel + 2);
+            }
+            g->pad = s;
+            break;
+        }
+        case kKeyRequest:
+            if (g) g_force_key = true;
+            break;
+        case kBye:
+            if (g) drop(*g, "left");
+            break;
+        default: break; // punches
+        }
     }
-    drop_guest(g);
 }
 
-void welcome(SOCKET s) {
-    no_delay(s);
-    DWORD timeout = 5000; // the hello, then no limit
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof timeout);
-    Type type;
-    std::vector<uint8_t> p;
-    uint32_t magic = 0;
-    uint16_t version = 0;
-    if (!read_packet(s, type, p) || type != kHello || p.size() < 38 || (std::memcpy(&magic, p.data(), 4), magic != kMagic) ||
-        (std::memcpy(&version, p.data() + 4, 2), version != kVersion)) {
-        closesocket(s);
-        return;
-    }
-    timeout = 0;
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof timeout);
-    auto g = std::make_shared<Guest>();
-    g->socket = s;
-    g->name.assign(reinterpret_cast<const char*>(p.data() + 6), strnlen(reinterpret_cast<const char*>(p.data() + 6), 32));
-    {
-        std::lock_guard lock(g_mutex);
-        const auto free = std::find(g_guests.begin(), g_guests.end(), nullptr);
-        if (free == g_guests.end()) {
-            const auto full = packet(kFull, nullptr, 0);
-            send_all(s, full.data(), full.size());
-            closesocket(s);
-            return;
+// The room on the room server, every two seconds: listed, and the guests trying to reach it introduced.
+void host_rooms_main() {
+    const uint32_t id = random_id();
+    for (int round = 0;; ++round) {
+        if (g_socket.pub().ip == 0 || round % 15 == 0) g_socket.ask_stun(); // (and now and then: NATs forget)
+        CheckIn c;
+        c.id = id;
+        c.pub = g_socket.pub();
+        c.lan = g_socket.lan();
+        c.room.name = g_room_name;
+        c.room.players = 1 + g_guest_count;
+        c.room.max = kMaxPlayers;
+        const CheckInReply r = check_in(c);
+        if (round == 0) {
+            std::fprintf(stderr, r.ok ? "ttt2: netplay: room listed on %s\n" : "ttt2: netplay: room server %s not reached; "
+                                                                               "guests can still join by address\n",
+                         room_server().c_str());
         }
-        g->channel = static_cast<int>(free - g_guests.begin());
-        *free = g;
+        for (const Introduction& peer : r.peers) { // open the way from this side too
+            g_socket.send(peer.pub, kPunch);
+            if (peer.lan.ip) g_socket.send(peer.lan, kPunch);
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(2));
     }
-    const uint8_t w[5] = {static_cast<uint8_t>(g->channel), kStreamWidth & 0xFF, kStreamWidth >> 8, kStreamHeight & 0xFF,
-                          kStreamHeight >> 8};
-    const auto hello = packet(kWelcome, w, sizeof w);
-    send_all(s, hello.data(), hello.size());
-    ++g_guest_count;
-    g_force_key = true;
-    std::fprintf(stderr, "ttt2: netplay: %s joined as player %d\n", g->name.c_str(), g->channel + 2);
-    std::thread(sender, g).detach();
-    std::thread(receiver, g).detach();
 }
 
 // ------------------------------------------------------------------ guest
@@ -571,32 +682,17 @@ void show_error(const std::string& text) {
 
 // ------------------------------------------------------------------ host
 
-bool start_host(uint16_t port) {
-    start_winsock();
-    SOCKET listener = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
-    DWORD v6only = 0; // IPv4 guests too
-    setsockopt(listener, IPPROTO_IPV6, IPV6_V6ONLY, reinterpret_cast<const char*>(&v6only), sizeof v6only);
-    sockaddr_in6 address{};
-    address.sin6_family = AF_INET6;
-    address.sin6_port = htons(port);
-    address.sin6_addr = in6addr_any;
-    if (listener == INVALID_SOCKET || bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof address) != 0 ||
-        listen(listener, 8) != 0) {
-        std::fprintf(stderr, "ttt2: netplay: cannot take guests on port %u (error %d)\n", port, WSAGetLastError());
-        closesocket(listener);
+bool start_host(const std::string& name) {
+    if (!g_socket.open(kDefaultPort)) {
+        std::fprintf(stderr, "ttt2: netplay: no UDP socket (error %d)\n", WSAGetLastError());
         return false;
     }
+    g_room_name = name.empty() ? "Player" : name;
     g_hosting = true;
-    std::fprintf(stderr, "ttt2: netplay: hosting on port %u (players 2-8 join with smash.exe --join <this PC>:%u)\n", port,
-                 port);
+    std::fprintf(stderr, "ttt2: netplay: hosting %s's room on UDP port %u\n", g_room_name.c_str(), g_socket.lan().port);
     std::thread(encoder_main).detach();
-    std::thread([listener] {
-        for (;;) {
-            const SOCKET s = accept(listener, nullptr, nullptr);
-            if (s == INVALID_SOCKET) return;
-            std::thread(welcome, s).detach();
-        }
-    }).detach();
+    std::thread(host_receive_main).detach();
+    std::thread(host_rooms_main).detach();
     return true;
 }
 
@@ -625,74 +721,114 @@ void video_frame(const uint8_t* pixels, bool bgra, std::function<void()> wait, s
 
 void audio(const float* frames, uint32_t count) {
     if (g_guest_count == 0) return;
-    // ~10 ms a packet.
+    // 5 ms a datagram.
     static std::vector<int16_t> pending;
     for (uint32_t i = 0; i < 2 * count; ++i) {
         pending.push_back(static_cast<int16_t>(std::clamp(frames[i], -1.0f, 1.0f) * 32767.0f));
     }
-    if (pending.size() < 2 * 480) return;
-    broadcast(kAudio, pending.data(), pending.size() * 2);
+    if (pending.size() < 2 * 240) return;
+    send_all_guests(kAudio, pending.data(), pending.size() * 2);
     pending.clear();
 }
 
 // ------------------------------------------------------------------ guest
 
-int run_guest(const std::string& address, const std::string& name) {
-    start_winsock();
-    std::string host = address, port = std::to_string(kDefaultPort);
-    // HOST:PORT, [IPv6]:PORT, or a bare host.
-    if (!host.empty() && host[0] == '[') {
-        const size_t close = host.find(']');
-        if (close != std::string::npos) {
-            if (close + 1 < host.size() && host[close + 1] == ':') port = host.substr(close + 2);
-            host = host.substr(1, close - 1);
-        }
-    } else if (std::count(host.begin(), host.end(), ':') == 1) {
-        port = host.substr(host.find(':') + 1);
-        host = host.substr(0, host.find(':'));
-    }
+int run_guest(const std::string& target, const std::string& name) {
     SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_AUDIO);
-
-    addrinfo hints{};
-    hints.ai_socktype = SOCK_STREAM;
-    addrinfo* found = nullptr;
-    if (getaddrinfo(host.c_str(), port.c_str(), &hints, &found) != 0 || found == nullptr) {
-        show_error("Cannot find " + address + ".");
+    Socket socket;
+    if (!socket.open(0)) {
+        show_error("No network (a UDP socket could not be opened).");
         return 1;
     }
-    SOCKET s = INVALID_SOCKET;
-    for (addrinfo* a = found; a && s == INVALID_SOCKET; a = a->ai_next) {
-        s = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
-        if (s != INVALID_SOCKET && connect(s, a->ai_addr, static_cast<int>(a->ai_addrlen)) != 0) {
-            closesocket(s);
-            s = INVALID_SOCKET;
+    // Where the host may be: a room's (introduced by the room server, public and local) or an address.
+    std::vector<Endpoint> candidates;
+    uint32_t room = 0;
+    if (target.rfind("room:", 0) == 0) {
+        room = static_cast<uint32_t>(std::strtoul(target.c_str() + 5, nullptr, 16));
+    } else {
+        std::string host = target, port = std::to_string(kDefaultPort);
+        if (std::count(host.begin(), host.end(), ':') == 1) {
+            port = host.substr(host.find(':') + 1);
+            host = host.substr(0, host.find(':'));
         }
+        addrinfo hints{};
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_DGRAM;
+        addrinfo* found = nullptr;
+        if (getaddrinfo(host.c_str(), port.c_str(), &hints, &found) != 0 || found == nullptr) {
+            show_error("Cannot find " + target + ".");
+            return 1;
+        }
+        candidates.push_back(endpoint_of(*reinterpret_cast<sockaddr_in*>(found->ai_addr)));
+        freeaddrinfo(found);
     }
-    freeaddrinfo(found);
-    if (s == INVALID_SOCKET) {
-        show_error("Cannot connect to " + address + ". Is the host's game running with netplay on, and port " + port +
-                   " open to you (forwarded on their router, or on the same LAN or VPN)?");
-        return 1;
-    }
-    no_delay(s);
+
+    // Hello until welcomed (20 s), asking the room server for the host's addresses meanwhile.
     uint8_t hello[38] = {};
     std::memcpy(hello, &kMagic, 4);
     std::memcpy(hello + 4, &kVersion, 2);
     std::memcpy(hello + 6, name.data(), std::min<size_t>(name.size(), 31));
-    const auto hello_packet = packet(kHello, hello, sizeof hello);
-    Type type = kHello;
-    std::vector<uint8_t> p;
-    if (!send_all(s, hello_packet.data(), hello_packet.size()) || !read_packet(s, type, p) || type == kFull ||
-        type != kWelcome || p.size() < 5) {
-        show_error(type == kFull ? "The host's game is full (8 players)." : "The host did not answer as Smash 4 PC netplay.");
-        closesocket(s);
+    std::atomic<bool> introduced{room == 0}, stop_rooms{false};
+    std::mutex candidates_mutex;
+    std::thread rooms;
+    if (room) {
+        rooms = std::thread([&] {
+            const uint32_t id = random_id();
+            for (int round = 0; !stop_rooms; ++round) {
+                if (socket.pub().ip == 0 || round % 10 == 0) socket.ask_stun();
+                CheckIn c;
+                c.id = id;
+                c.pub = socket.pub();
+                c.lan = socket.lan();
+                c.want = room;
+                const CheckInReply r = check_in(c);
+                for (const Introduction& peer : r.peers) {
+                    if (peer.id != room) continue;
+                    std::lock_guard lock(candidates_mutex);
+                    for (Endpoint e : {peer.pub, peer.lan}) {
+                        if (e.ip && std::find(candidates.begin(), candidates.end(), e) == candidates.end()) candidates.push_back(e);
+                    }
+                    introduced = true;
+                }
+                for (int i = 0; i < 10 && !stop_rooms; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        });
+    }
+    Endpoint host_address{};
+    int player = 0;
+    uint32_t width = 0, height = 0;
+    bool full = false;
+    std::vector<uint8_t> p(2048);
+    const auto asked = Clock::now();
+    while (player == 0 && !full && Clock::now() - asked < std::chrono::seconds(20)) {
+        {
+            std::lock_guard lock(candidates_mutex);
+            for (const Endpoint& e : candidates) socket.send(e, kHello, hello, sizeof hello);
+        }
+        Endpoint from;
+        const size_t n = socket.receive(p.data(), p.size(), from);
+        if (n >= 6 && p[0] == kWelcome) {
+            host_address = from;
+            player = p[1] + 2;
+            width = p[2] | p[3] << 8;
+            height = p[4] | p[5] << 8;
+        } else if (n >= 1 && p[0] == kFull) {
+            full = true;
+        }
+    }
+    stop_rooms = true;
+    if (rooms.joinable()) rooms.join();
+    if (player == 0) {
+        show_error(full           ? "That room is full (8 players)."
+                   : !introduced  ? "The room server did not know that room: it has closed, or the server is not reachable."
+                   : room         ? "Could not reach the host's PC. One of your routers may not allow direct connections "
+                                    "(some mobile and carrier connections); a VPN such as Tailscale works around it."
+                                  : "No answer from " + target + ". Is the host's game running with netplay on?");
         return 1;
     }
-    const int player = p[0] + 2;
-    const uint32_t width = p[1] | p[2] << 8, height = p[3] | p[4] << 8;
 
     char title[96];
-    std::snprintf(title, sizeof title, "Smash 4 PC - netplay at %s (player %d)", address.c_str(), player);
+    std::snprintf(title, sizeof title, "Smash 4 PC - netplay (player %d)", player);
     SDL_Window* window = SDL_CreateWindow(title, 1280, 720, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     SDL_Renderer* renderer = window ? SDL_CreateRenderer(window, nullptr) : nullptr;
     if (renderer == nullptr) {
@@ -713,19 +849,65 @@ int run_guest(const std::string& address, const std::string& name) {
     SDL_AudioStream* sound = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
     if (sound) SDL_ResumeAudioStreamDevice(sound);
 
-    // Received on a thread of its own: the newest picture for the window, the sound straight to the device.
+    // Received on a thread of its own: frames put together from their pieces and decoded (the newest picture for
+    // the window), the sound straight to the device.
     std::mutex picture_mutex;
     std::vector<uint8_t> picture;
     bool fresh = false;
-    std::atomic<bool> connected{true};
-    std::atomic<uint32_t> pictures{0}, video_bytes{0}; // for the log, every 10 s
-    std::thread([&, s] {
+    std::atomic<bool> connected{true}, leaving{false};
+    std::atomic<uint32_t> pictures{0}, video_bytes{0}, lost_frames{0}; // for the log, every 10 s
+    std::thread receiver([&] {
         Decoder decoder;
         if (!decoder.open(width, height)) std::fprintf(stderr, "smash: netplay: no H.264 decoder\n");
-        Type t;
+        uint32_t frame = 0, pieces = 0, got = 0;
         std::vector<uint8_t> data;
-        while (read_packet(s, t, data)) {
-            if (t == kVideo) {
+        std::vector<bool> have;
+        bool broken = true; // until a keyframe
+        auto heard = Clock::now(), asked_key = Clock::time_point{};
+        const auto ask_key = [&] {
+            if (Clock::now() - asked_key < std::chrono::milliseconds(250)) return;
+            asked_key = Clock::now();
+            socket.send(host_address, kKeyRequest);
+        };
+        std::vector<uint8_t> q(2048);
+        while (!leaving) {
+            Endpoint from;
+            const size_t n = socket.receive(q.data(), q.size(), from);
+            if (n == 0 || !(from == host_address)) {
+                if (Clock::now() - heard > kSilence) break;
+                continue;
+            }
+            heard = Clock::now();
+            if (q[0] == kVideo && n > 10) {
+                const uint32_t f = le32(q.data() + 1);
+                uint16_t index, count;
+                std::memcpy(&index, q.data() + 5, 2);
+                std::memcpy(&count, q.data() + 7, 2);
+                if (f < frame || count == 0 || index >= count) continue; // (an old frame's piece)
+                if (f != frame) {
+                    if (got != pieces) { // the last frame never completed
+                        broken = true;
+                        ++lost_frames;
+                    }
+                    frame = f;
+                    pieces = count;
+                    got = 0;
+                    data.assign(size_t{count} * kPiece, 0);
+                    have.assign(count, false);
+                }
+                if (have[index]) continue;
+                have[index] = true;
+                ++got;
+                const size_t length = n - 10;
+                std::memcpy(data.data() + size_t{index} * kPiece, q.data() + 10, length);
+                if (index + 1 == count) data.resize(size_t{index} * kPiece + length);
+                if (got != pieces) continue;
+                const bool key = q[9] != 0;
+                if (broken && !key) {
+                    ask_key();
+                    continue;
+                }
+                broken = false;
                 video_bytes += static_cast<uint32_t>(data.size());
                 decoder.decode(data.data(), data.size(), [&](const BYTE* nv12, UINT32 w, UINT32 h) {
                     if (w != width || h < height) return;
@@ -734,17 +916,17 @@ int run_guest(const std::string& address, const std::string& name) {
                     fresh = true;
                     ++pictures;
                 });
-            } else if (t == kAudio && sound) {
+            } else if (q[0] == kAudio && sound) {
                 // Over 150 ms queued (the link stalled): start over rather than lag behind.
                 if (SDL_GetAudioStreamQueued(sound) > static_cast<int>(kAudioRate * 4 * 15 / 100)) SDL_ClearAudioStream(sound);
-                SDL_PutAudioStreamData(sound, data.data(), static_cast<int>(data.size()));
+                SDL_PutAudioStreamData(sound, q.data() + 1, static_cast<int>(n - 1));
             }
         }
         connected = false;
-    }).detach();
+    });
 
-    os::ProPadState sent{};
-    auto last_sent = std::chrono::steady_clock::now(), last_log = last_sent;
+    uint32_t sequence = 0;
+    auto last_log = Clock::now();
     bool running = true;
     while (running && connected) {
         SDL_Event e;
@@ -754,24 +936,20 @@ int run_guest(const std::string& address, const std::string& name) {
                 SDL_SetWindowFullscreen(window, !(SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN));
             }
         }
-        // The controller: when it changes, and every 50 ms.
+        // The controller, every frame (a lost one is replaced by the next).
         const os::ProPadState now = local_pad();
-        const auto t = std::chrono::steady_clock::now();
-        if (std::memcmp(&now, &sent, sizeof now) != 0 || t - last_sent > std::chrono::milliseconds(50)) {
-            uint8_t input[12];
-            std::memcpy(input, &now.buttons, 4);
-            const int16_t axes[4] = {static_cast<int16_t>(now.left_x * 32767), static_cast<int16_t>(now.left_y * 32767),
-                                     static_cast<int16_t>(now.right_x * 32767), static_cast<int16_t>(now.right_y * 32767)};
-            std::memcpy(input + 4, axes, 8);
-            const auto pkt = packet(kInput, input, sizeof input);
-            if (!send_all(s, pkt.data(), pkt.size())) break;
-            sent = now;
-            last_sent = t;
-        }
-        if (t - last_log > std::chrono::seconds(10)) {
-            std::fprintf(stderr, "smash: netplay: %.1f pictures/s, %.1f Mbit/s\n", pictures.exchange(0) / 10.0,
-                         video_bytes.exchange(0) * 8 / 10.0 / 1e6);
-            last_log = t;
+        uint8_t input[16];
+        ++sequence;
+        std::memcpy(input, &sequence, 4);
+        std::memcpy(input + 4, &now.buttons, 4);
+        const int16_t axes[4] = {static_cast<int16_t>(now.left_x * 32767), static_cast<int16_t>(now.left_y * 32767),
+                                 static_cast<int16_t>(now.right_x * 32767), static_cast<int16_t>(now.right_y * 32767)};
+        std::memcpy(input + 8, axes, 8);
+        socket.send(host_address, kInput, input, sizeof input);
+        if (Clock::now() - last_log > std::chrono::seconds(10)) {
+            std::fprintf(stderr, "smash: netplay: %.1f pictures/s, %.1f Mbit/s, %u frames lost\n", pictures.exchange(0) / 10.0,
+                         video_bytes.exchange(0) * 8 / 10.0 / 1e6, lost_frames.exchange(0));
+            last_log = Clock::now();
         }
         {
             std::lock_guard lock(picture_mutex);
@@ -786,7 +964,9 @@ int run_guest(const std::string& address, const std::string& name) {
         SDL_RenderTexture(renderer, texture, nullptr, nullptr);
         SDL_RenderPresent(renderer);
     }
-    closesocket(s);
+    socket.send(host_address, kBye);
+    leaving = true;
+    receiver.join();
     // SMASH_NETPLAY_DUMP=FILE: the last picture, raw NV12, for checking the stream.
     if (const char* dump = std::getenv("SMASH_NETPLAY_DUMP")) {
         std::lock_guard lock(picture_mutex);

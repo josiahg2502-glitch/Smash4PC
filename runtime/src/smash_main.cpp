@@ -51,7 +51,8 @@ namespace {
 
 void usage(const char* argv0) {
     std::fprintf(stderr,
-                 "usage: %s [--mod FOLDER]... [--dlc FOLDER] [UPDATE] BASE\n"
+                 "usage: %s [--mod FOLDER]... [--dlc FOLDER] [--host NAME] [UPDATE] BASE\n"
+                 "       %s --join room:ID|HOST[:PORT] [NAME]\n"
                  "  Each --mod FOLDER holds content/ (and maybe code/) laid over the game's;\n"
                  "  the first mod given wins.\n"
                  "  UPDATE and BASE are the title folders (code/, content/, meta/) of\n"
@@ -110,7 +111,7 @@ uint32_t guest_strdup(const char* text) {
 
 int main(int argc, char** argv) {
     using namespace cafe;
-    // --join HOST[:PORT] [NAME]: play on another PC's game (netplay guest): no game files, no game code run.
+    // --join room:ID|HOST[:PORT] [NAME]: play on another PC's game (netplay guest): no game files, no game code run.
     if (argc >= 3 && std::strcmp(argv[1], "--join") == 0) {
         return host::netplay::run_guest(argv[2], argc >= 4 ? argv[3] : "Player");
     }
@@ -129,13 +130,13 @@ int main(int argc, char** argv) {
 #endif
     // --mod FOLDER (repeatable, the first wins): a folder holding content/ laid over the game's.
     // --dlc FOLDER: the DLC title (code/app.xml, content/<item>/), reported to the game through nn_aoc.
-    // --host PORT: take netplay guests (host/netplay.h) on that port.
+    // --host NAME: take netplay guests (host/netplay.h), the room listed as NAME's.
     std::vector<std::filesystem::path> layers;
-    uint16_t host_port = 0;
+    const char* host_name = nullptr;
     while (argc >= 3 && (std::strcmp(argv[1], "--mod") == 0 || std::strcmp(argv[1], "--dlc") == 0 ||
                          std::strcmp(argv[1], "--host") == 0)) {
         if (std::strcmp(argv[1], "--host") == 0) {
-            host_port = static_cast<uint16_t>(std::atoi(argv[2]));
+            host_name = argv[2];
         } else if (std::strcmp(argv[1], "--mod") == 0) {
             layers.emplace_back(argv[2]);
             std::fprintf(stderr, "smash: mod %s\n", argv[2]);
@@ -211,7 +212,7 @@ int main(int argc, char** argv) {
     const bool headless =
         (gpu && std::strcmp(gpu, "null") == 0) || !host::open_window("Smash 4 PC");
     host::open_audio();
-    if (host_port != 0) host::netplay::start_host(host_port);
+    if (host_name) host::netplay::start_host(host_name);
     if (headless) return run();
     smash::start_overlay(std::filesystem::absolute(argv[0]).parent_path());
     std::atomic<bool> finished{false};

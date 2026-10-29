@@ -116,7 +116,9 @@ if(SMASH_GENERATED_DIR)
     add_executable(smash-launcher WIN32 launcher/smash/main.cpp runtime/src/host/display_settings.cpp
         # Pretendo sign-in (the Online page)
         runtime/src/os/online_identity.cpp runtime/src/os/sect233.cpp runtime/src/os/act_server.cpp
-        runtime/src/host/http.cpp)
+        runtime/src/host/http.cpp
+        # Netplay's room list (the Netplay page)
+        runtime/src/host/rooms.cpp)
     set_target_properties(smash-launcher PROPERTIES OUTPUT_NAME "Smash 4 PC")
     if(WIN32)
         target_sources(smash-launcher PRIVATE runtime/res/smash.rc)

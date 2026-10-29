@@ -10,6 +10,7 @@
 
 #include "host/cpu_level.h"
 #include "host/display_settings.h"
+#include "host/rooms.h"
 #include "os/act_server.h"
 #include "os/online_identity.h"
 #include "host/paint.h" // before the stb_truetype implementation below
@@ -306,7 +307,6 @@ Image load_image(SDL_Renderer* renderer, const fs::path& path) {
 
 enum class Screen { kMain, kSettings, kMods, kOnline, kNetplay };
 
-constexpr int kNetplayPort = 52700; // host/netplay.h's kDefaultPort
 
 struct Item {
     std::string label;
@@ -327,7 +327,6 @@ public:
         if (auto it = ini.find("game_folder"); it != ini.end()) find_titles(it->second, paths_); // older file
         if (auto it = ini.find("netplay_host"); it != ini.end()) netplay_host_ = it->second == "yes";
         if (auto it = ini.find("netplay_name"); it != ini.end()) netplay_name_ = it->second;
-        if (auto it = ini.find("netplay_join"); it != ini.end()) join_address_ = it->second;
         online::load(dir_ / "online");
         refresh();
         font_.open({dir_ / "fonts" / "launcher.ttf", "C:/Windows/Fonts/bahnschrift.ttf", "C:/Windows/Fonts/segoeui.ttf",
@@ -577,7 +576,8 @@ private:
     // The main menu: Play, the game / update / DLC folders, Settings, Mods, Quit.
     enum MainItem { kPlay, kGameItem, kUpdateItem, kDlcItem, kOnlineItem, kNetplayItem, kSettingsItem, kModsItem, kQuitItem };
     // The Netplay page (host/netplay.h: the host's game streamed to its guests): hosting, a name, joining.
-    enum NetplayItem { kHostSwitch, kNameField, kAddressField, kJoin, kNetplayBack };
+    // Then the open rooms (or a line saying there are none), then Back.
+    enum NetplayItem { kHostSwitch, kNameField, kFirstRoom };
     // The Online page: the console's files, the Pretendo ID and password, signing in and out.
     enum OnlineItem { kConsoleFiles, kUserField, kPasswordField, kSignIn, kSignOut, kOnlineBack };
     static constexpr int kSettingsBack = 3;
@@ -668,10 +668,17 @@ private:
                 return text.empty() ? std::string("Type...") : text;
             };
             list_ = {{"HOST MY GAMES", netplay_host_ ? "On" : "Off"},
-                     {"MY NAME", field(kNameField, netplay_name_)},
-                     {"JOIN ADDRESS", field(kAddressField, join_address_)},
-                     {"JOIN GAME", process_ && joining_ ? "Playing..." : ""},
-                     {"BACK"}};
+                     {"MY NAME", field(kNameField, netplay_name_)}};
+            std::lock_guard lock(rooms_mutex_);
+            for (const auto& room : rooms_) {
+                std::string label = room.name + "'S ROOM";
+                for (char& ch : label) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+                list_.push_back({label, room.players >= room.max
+                                                            ? "Full"
+                                                            : std::to_string(room.players) + "/" + std::to_string(room.max)});
+            }
+            if (rooms_.empty()) list_.push_back({rooms_reached_ ? "NO OPEN ROOMS" : "LOOKING FOR ROOMS..."});
+            list_.push_back({"BACK"});
             break;
         }
         case Screen::kMods:
@@ -694,6 +701,7 @@ private:
         selected_ = (selected_ + d + n) % n;
     }
     void go(Screen s) {
+        if (s == Screen::kNetplay) watch_rooms();
         screen_ = s;
         selected_ = 0;
         selection_y_ = 0;
@@ -768,10 +776,11 @@ private:
         case Screen::kNetplay:
             switch (selected_) {
             case kHostSwitch: change(1); break;
-            case kNameField:
-            case kAddressField: start_editing(selected_); break;
-            case kJoin: join(); break;
-            default: back(); break;
+            case kNameField: start_editing(selected_); break;
+            default:
+                if (selected_ + 1 == static_cast<int>(items().size())) back();
+                else join(selected_ - kFirstRoom);
+                break;
             }
             break;
         case Screen::kOnline:
@@ -913,8 +922,7 @@ private:
         launch_error_.clear();
         // smash.exe [--host PORT] [--mod FOLDER]... UPDATE GAME; smash-base.exe GAME (mods are made for the update).
         std::vector<std::string> words{game_exe().string()};
-        if (netplay_host_) words.insert(words.end(), {"--host", std::to_string(kNetplayPort)});
-        joining_ = false;
+        if (netplay_host_) words.insert(words.end(), {"--host", netplay_name_.empty() ? "Player" : netplay_name_});
         if (valid_[kUpdate]) {
             for (const Mod& m : mods_) {
                 if (m.on) words.insert(words.end(), {"--mod", m.root.string()});
@@ -938,51 +946,53 @@ private:
         }
     }
 
-    // Plays on a netplay host's game: smash.exe --join ADDRESS NAME (no game folder needed).
-    void join() {
+    // The room list, asked for every three seconds while the Netplay page shows.
+    void watch_rooms() {
+        if (rooms_thread_.joinable()) return;
+        rooms_thread_ = std::thread([this] {
+            while (!quit_) {
+                if (screen_ == Screen::kNetplay) {
+                    std::vector<cafe::host::netplay::Room> rooms;
+                    const bool reached = cafe::host::netplay::list_rooms(rooms);
+                    std::lock_guard lock(rooms_mutex_);
+                    rooms_reached_ = reached;
+                    if (reached) rooms_ = rooms;
+                }
+                for (int i = 0; i < 30 && !quit_; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        });
+        rooms_thread_.detach();
+    }
+
+    // Plays in the listed room `index`: smash.exe --join room:ID NAME (no game folder needed).
+    void join(int index) {
         if (process_) return;
-        if (join_address_.empty()) {
-            selected_ = kAddressField;
-            start_editing(kAddressField);
-            return;
+        std::string target;
+        {
+            std::lock_guard lock(rooms_mutex_);
+            if (index < 0 || index >= static_cast<int>(rooms_.size())) return;
+            const auto& room = rooms_[index];
+            if (room.players >= room.max) {
+                launch_error_ = room.name + "'s room is full";
+                return;
+            }
+            char id[16];
+            std::snprintf(id, sizeof id, "room:%06x", room.id);
+            target = id;
         }
         save_launcher_ini();
         const std::string exe = (dir_ / "smash.exe").string();
         const std::string name = netplay_name_.empty() ? "Player" : netplay_name_;
-        const char* args[] = {exe.c_str(), "--join", join_address_.c_str(), name.c_str(), nullptr};
+        const char* args[] = {exe.c_str(), "--join", target.c_str(), name.c_str(), nullptr};
         SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "SMASH_LOG", (dir_ / "smash.log").string().c_str(), true);
         process_ = SDL_CreateProcess(args, false);
         if (process_) {
-            joining_ = true;
             exit_code_ = 0;
             launch_error_.clear();
             SDL_MinimizeWindow(window_);
         } else {
             launch_error_ = SDL_GetError();
         }
-    }
-
-    // This PC's IPv4 addresses, for telling guests where to join.
-    static std::string local_addresses() {
-        std::string list;
-        static const bool started = [] {
-            WSADATA data;
-            return WSAStartup(MAKEWORD(2, 2), &data) == 0;
-        }();
-        char name[256] = {};
-        if (!started) return list;
-        if (gethostname(name, sizeof name) != 0) return list;
-        addrinfo hints{};
-        hints.ai_family = AF_INET;
-        addrinfo* found = nullptr;
-        if (getaddrinfo(name, nullptr, &hints, &found) != 0) return list;
-        for (addrinfo* a = found; a; a = a->ai_next) {
-            char text[64] = {};
-            inet_ntop(AF_INET, &reinterpret_cast<sockaddr_in*>(a->ai_addr)->sin_addr, text, sizeof text);
-            if (list.find(text) == std::string::npos) list += (list.empty() ? "" : ", ") + std::string(text);
-        }
-        freeaddrinfo(found);
-        return list;
     }
 
     void choose_folder(Slot slot) {
@@ -1024,7 +1034,7 @@ private:
                "# (0005000C10144F00) folders, as chosen in the menu. Only the game is needed.\n";
         for (int s = 0; s < kSlots; ++s) out << kSlotKeys[s] << " = " << paths_[s].string() << "\n";
         out << "netplay_host = " << (netplay_host_ ? "yes" : "no") << "\nnetplay_name = " << netplay_name_
-            << "\nnetplay_join = " << join_address_ << "\n";
+            << "\n";
     }
 
     // Shortened with "..." in the middle to fit `width`.
@@ -1086,14 +1096,18 @@ private:
             if (!launch_error_.empty()) {
                 line = "Could not start: " + launch_error_;
                 c = kBad;
-            } else if (selected_ >= kAddressField && selected_ <= kJoin) {
-                line = "Play on a friend's game: their address (and :port if not " + std::to_string(kNetplayPort) + "), then Join.";
-                detail = "You need no game files to join. Your controller is one of their Pro Controllers.";
+            } else if (selected_ >= kFirstRoom && selected_ + 1 < static_cast<int>(items().size())) {
+                bool none;
+                {
+                    std::lock_guard lock(rooms_mutex_);
+                    none = rooms_.empty();
+                }
+                line = none ? "Rooms appear here while their host plays with HOST MY GAMES on."
+                                      : "Join: you play on the host's game as the next free player (up to 8).";
+                detail = "You need no game files to join. Your pads and keyboard play as one of their Pro Controllers.";
             } else if (netplay_host_) {
-                if (addresses_.empty()) addresses_ = local_addresses();
-                line = "Hosting: friends join at " + (addresses_.empty() ? std::string("this PC's address") : addresses_) +
-                       " (port " + std::to_string(kNetplayPort) + ").";
-                detail = "Internet: forward TCP " + std::to_string(kNetplayPort) + " to this PC, or all join one Tailscale/ZeroTier network.";
+                line = "Hosting: while you play, your room is listed and friends join from their list.";
+                detail = "No setup needed: nothing to forward on your router. Up to 7 friends join as players 2-8.";
                 c = kGood;
             } else {
                 line = "Host: your game is streamed to up to 7 friends, who play as players 2-8.";
@@ -1191,9 +1205,7 @@ private:
     // Typing in the ID or password field; true if the event was the field's.
     bool text_event(const SDL_Event& e) {
         const bool netplay = screen_ == Screen::kNetplay;
-        std::string& text = netplay ? (editing_ == kNameField ? netplay_name_ : join_address_)
-                            : editing_ == kUserField ? user_
-                                                     : password_;
+        std::string& text = netplay ? netplay_name_ : editing_ == kUserField ? user_ : password_;
         // A PNID is at most 16 characters (and a netplay name, sent in 31 bytes).
         const size_t limit = editing_ == kUserField || (netplay && editing_ == kNameField) ? 16 : 64;
         switch (e.type) {
@@ -1214,7 +1226,6 @@ private:
                 const int was = editing_;
                 stop_editing();
                 if (netplay) {
-                    if (was == kAddressField && e.key.key != SDLK_TAB) join();
                 } else if (was == kUserField) {
                     selected_ = kPasswordField;
                     start_editing(kPasswordField);
@@ -1596,8 +1607,12 @@ private:
     Installed install_result_;
     int editing_ = -1; // the field being typed in
     // Netplay.
-    bool netplay_host_ = false, joining_ = false;
-    std::string netplay_name_, join_address_, addresses_;
+    bool netplay_host_ = false;
+    std::string netplay_name_;
+    std::thread rooms_thread_;
+    std::mutex rooms_mutex_;
+    std::vector<cafe::host::netplay::Room> rooms_;
+    bool rooms_reached_ = false;
     std::vector<SDL_FRect> online_rects_; // each Online row's box, for the mouse
     std::string user_, password_, online_status_;
     std::mutex sign_in_mutex_;

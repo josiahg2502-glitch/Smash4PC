@@ -65,6 +65,7 @@ add_library(cafe_runtime OBJECT
     src/gpu/vulkan/textures.cpp
     src/host/audio.cpp
     src/host/netplay.cpp
+    src/host/rooms.cpp
     src/host/display_settings.cpp
     src/host/keymap.cpp
     src/host/window.cpp
