@@ -156,6 +156,7 @@ Texture* Renderer::texture(const uint32_t words[7]) {
         }
         entry = std::move(t);
     }
+    entry->used_frame = frame_number_;
     load_texture(*entry);
     return entry.get();
 }
@@ -552,6 +553,41 @@ void Renderer::load_texture(Texture& t) {
                       r.tile_mode);
         save_image(rgba, std::string(dump) + name, true);
         destroy_image(rgba);
+    }
+}
+
+// Smash binds thousands of distinct textures over a session (each fighter, stage and menu), and kept they
+// filled video memory and grew the page lists every CPU write walks: the game slowed the longer it ran.
+// Textures no draw bound for 10 seconds leave the cache (one used again is recreated and reloaded); their
+// images go once the GPU is past the work that may still sample them, so this never waits on the GPU.
+void Renderer::evict_textures() {
+    uint64_t done = 0;
+    VK_CHECK(vkGetSemaphoreCounterValue(ctx_.device, timeline_, &done));
+    std::erase_if(retired_textures_, [&](auto& r) {
+        if (r.first > done) return false;
+        vkDestroyImageView(ctx_.device, r.second->view, nullptr);
+        destroy_image(r.second->image);
+        return true;
+    });
+    constexpr uint64_t kUnusedFrames = 600;
+    const uint64_t value = submitted_ + 1; // the batch being recorded may still bind them
+    for (auto it = textures_.begin(); it != textures_.end();) {
+        Texture* t = it->second.get();
+        if (frame_number_ - t->used_frame < kUnusedFrames) {
+            ++it;
+            continue;
+        }
+        for (const auto& range : t->memory) {
+            if (range[1] <= range[0]) continue;
+            for_pages(range[0], range[1], [&](uint32_t page) {
+                const auto p = texture_pages_.find(page);
+                if (p == texture_pages_.end()) return;
+                std::erase(p->second, t);
+                if (p->second.empty()) texture_pages_.erase(p);
+            });
+        }
+        retired_textures_.emplace_back(value, std::move(it->second));
+        it = textures_.erase(it);
     }
 }
 

@@ -659,6 +659,7 @@ void Renderer::swap() {
     const double t = now_seconds();
     if (t - window_start_ >= 10.0) {
         save_pipeline_cache();
+        evict_textures();
         std::fprintf(stderr, "ttt2: gpu: %.1f frames/s, %.0f draws per frame (%.0f skipped), %zu targets, %zu textures, "
                              "%zu shaders, %zu pipelines; %.1f GPU waits, %.1f ms waiting (%.1f ms GPU busy) per frame; %llu/%llu extra frames blended (%llu skipped: GPU behind), %.1f MB recorded; replay %.1f ms (matching %.1f)\n",
                      frames_ / (t - window_start_), double(draws_) / std::max<uint64_t>(frames_, 1),

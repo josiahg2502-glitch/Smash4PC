@@ -109,6 +109,7 @@ struct Texture {
     uint64_t loaded = 0;     // event stamp the contents correspond to
     uint64_t hash = 0;       // of the guest data last loaded
     bool dirty = true;       // the CPU wrote its memory since it was loaded
+    uint64_t used_frame = 0; // frame_number_ of the last draw that bound it (evict_textures)
     const Target* source = nullptr; // render target the contents came from
     float scale = 1;        // image size over the resource's size (copied from upscaled targets)
     // A replacement (gpu/replacements.h) matched the contents: its index,
@@ -513,6 +514,9 @@ private:
 
     std::vector<std::unique_ptr<Target>> targets_;
     std::unordered_map<uint64_t, std::unique_ptr<Texture>> textures_;
+    // Textures dropped from textures_, destroyed once the GPU passes the submission value beside them.
+    std::vector<std::pair<uint64_t, std::unique_ptr<Texture>>> retired_textures_;
+    void evict_textures();
     // Textures and shader programs by the 64 KiB pages of guest memory they
     // use, for the CPU-write and cache-invalidation notices (hundreds a frame).
     std::unordered_map<uint32_t, std::vector<Texture*>> texture_pages_;

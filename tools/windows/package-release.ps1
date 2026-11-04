@@ -39,6 +39,8 @@ Copy-Item -Recurse (Join-Path $third 'cemu_nex') (Join-Path $licenses 'cemu_nex-
 
 $zip = Join-Path $dist "$name.zip"
 Remove-Item -Force $zip -ErrorAction SilentlyContinue
-Compress-Archive -Path $stage -DestinationPath $zip -CompressionLevel Optimal # (one top folder, as unzipped)
+# Not Compress-Archive or ZipFile: on PowerShell 5.1 they write backslashes, which Linux unzips as one flat folder of long names (#7).
+& (Join-Path $env:SystemRoot 'System32\tar.exe') -a -cf $zip -C $dist $name # (one top folder, as unzipped)
+if ($LASTEXITCODE) { throw 'tar failed' }
 Remove-Item -Recurse -Force $stage
 "$zip ($([math]::Round((Get-Item $zip).Length / 1MB)) MB)"
